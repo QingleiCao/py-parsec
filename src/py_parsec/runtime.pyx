@@ -15,9 +15,16 @@ Lifetimes
 The context keeps every taskpool whose work has not been completed by a wait,
 so a taskpool can be dropped at any time: its work still completes at the next
 :meth:`Context.wait` (or :meth:`Context.fini`). Finalizers never call into
-PaRSEC; a taskpool collected by Python is queued on its context and released
-by the next call that enters the runtime from the application (``start``,
-``wait``, ``add_taskpool``, creating a taskpool or a matrix, ``fini``).
+PaRSEC; a taskpool or matrix collected by Python is queued on its context and
+released by the next call that enters the runtime from the thread that
+created the context (``start``, ``wait``, ``add_taskpool``, creating a
+taskpool or a matrix, ``fini``), outside of any call that may run tasks.
+
+Threads
+-------
+Drive the runtime (insertions, flushes, waits, frees) from one thread at a
+time, normally the one that created the context. Task bodies run on PaRSEC
+threads and must not call these functions.
 """
 
 import atexit
@@ -28,6 +35,7 @@ cimport cython
 from libc.stdint cimport uint64_t, uintptr_t
 from libc.stdlib cimport free, malloc
 from cpython.pycapsule cimport PyCapsule_GetPointer, PyCapsule_IsValid
+from cpython.pythread cimport PyThread_get_thread_ident
 
 from py_parsec cimport cparsec as c
 
@@ -168,6 +176,9 @@ cdef class Context:
         self._taskpools = weakref.WeakSet()
         self._collections = weakref.WeakSet()
         self._deferred = []
+        self._owner = PyThread_get_thread_ident()
+        self._in_runtime = 0
+        self._batch = None
         if _live is not None:
             raise RuntimeError("the process already has a PaRSEC context; PaRSEC supports one per process")
         if _initialized_once:
@@ -231,16 +242,29 @@ cdef class Context:
             c.parsec_context_start(ctx)
         return 0
 
-    cdef int drain(self) except -1:
-        """Run the releases queued by finalizers."""
-        cdef Release release
+    cdef int drain(self, bint force=False) except -1:
+        """Run the releases queued by finalizers: only from the thread that
+        created the context and outside of any PaRSEC call that may run tasks
+        (a context wait, for instance, has already visited every taskpool)."""
+        cdef Deferred release
+        if not force and (self._in_runtime or PyThread_get_thread_ident() != self._owner):
+            return 0
         while self._deferred and self._ctx != NULL:
             release = self._deferred.pop(0)
             release.run()
         return 0
 
-    cdef defer(self, Release release):
+    cdef defer(self, Deferred release):
         self._deferred.append(release)
+
+    cdef int submit_batch(self) except -1:
+        """Insert the tasks an insert_tasks() call has converted so far, so
+        that a call made from its iterable keeps the order of the tasks."""
+        if self._batch is not None:
+            if PyThread_get_thread_ident() != self._batch.thread:
+                raise RuntimeError("insert_tasks() is running in another thread")
+            self._batch.submit()
+        return 0
 
     @property
     def address(self):
@@ -284,6 +308,7 @@ cdef class Context:
         cdef c.parsec_context_t *ctx = self.ptr()
         cdef Taskpool tp
         cdef int rc
+        self.submit_batch()
         self.drain()
         if not c.pyparsec_context_is_active(ctx):
             if not self._pending:
@@ -292,8 +317,12 @@ cdef class Context:
         pending = list(self._pending)
         for tp in pending:
             tp.flush_collections()
-        with nogil:
-            rc = c.parsec_context_wait(ctx)
+        self._in_runtime += 1
+        try:
+            with nogil:
+                rc = c.parsec_context_wait(ctx)
+        finally:
+            self._in_runtime -= 1
         if rc != c.PARSEC_SUCCESS:
             raise RuntimeError(f"parsec_context_wait failed ({rc})")
         errors = []
@@ -327,7 +356,7 @@ cdef class Context:
             return
         errors = []
         try:
-            self.wait()
+            self.wait()     # also inserts the tasks of an open insert_tasks() batch
         except BaseException as e:
             errors.append(e)
         for tp in list(self._taskpools):
@@ -336,19 +365,23 @@ cdef class Context:
             except BaseException as e:
                 errors.append(e)
         try:
-            self.drain()
+            self.drain(True)
         except BaseException as e:
             errors.append(e)
+        self._in_runtime += 1
         if self.is_active():
             with nogil:
                 c.parsec_context_wait(self._ctx)
+        # Matrices still referenced keep their storage, so that the tile
+        # arrays taken from them stay valid; their PaRSEC side goes now.
         for dc in list(self._collections):
-            dc.release()
+            dc._detach()
         for arena_id in self._dtd_arenas.values():
             c.parsec_dtd_free_arena_datatype(self._ctx, arena_id)
         self._dtd_arenas.clear()
         with nogil:
             c.parsec_fini(&self._ctx)
+        self._in_runtime -= 1
         self._ctx = NULL
         self._pending.clear()
         self._deferred.clear()
@@ -381,8 +414,18 @@ cdef void _default_destructor(c.parsec_taskpool_t *tp) noexcept nogil:
     c.parsec_taskpool_free(tp)
 
 
+cdef class Deferred:
+    cdef run(self):
+        pass
+
+
+cdef class PendingBatch:
+    cdef int submit(self) except -1:
+        return 0
+
+
 @cython.final
-cdef class Release:
+cdef class Release(Deferred):
     """The release of a taskpool collected by Python, run later by Context.drain()."""
 
     cdef run(self):
@@ -395,6 +438,29 @@ cdef class Release:
         self.tp = NULL
         self.task_classes = None
         self.keepalive = None   # the collections outlive the C taskpool
+
+
+@cython.final
+cdef class CollectionRelease(Deferred):
+    """The release of a matrix collected by Python, run later by Context.drain()."""
+
+    cdef run(self):
+        if self.desc != NULL:
+            c.pyparsec_tiled_matrix_free(self.desc, self.dtd_registered)
+            self.desc = NULL
+        if self.storage != NULL:
+            self.free_storage(self.storage)
+            self.storage = NULL
+
+
+cdef CollectionRelease make_collection_release(c.parsec_tiled_matrix_t *desc, bint dtd_registered,
+                                               void *storage, c.parsec_data_free_t free_storage):
+    cdef CollectionRelease r = CollectionRelease.__new__(CollectionRelease)
+    r.desc = desc
+    r.dtd_registered = dtd_registered
+    r.storage = storage
+    r.free_storage = free_storage
+    return r
 
 
 cdef Release make_release(c.parsec_taskpool_t *tp, taskpool_destructor_t destruct,
@@ -500,14 +566,20 @@ cdef class Taskpool:
         For a DTD taskpool, the collections its tasks used are flushed first.
         The first exception raised by one of its Python task bodies is raised.
         """
-        cdef c.parsec_taskpool_t *tp = self.ptr()
+        cdef c.parsec_taskpool_t *tp
         cdef Context ctx = self.enqueued_context()
         cdef int rc
+        ctx.submit_batch()
+        tp = self.ptr()
         ctx.drain()
         ctx.ensure_started()
         self.flush_collections()
-        with nogil:
-            rc = c.parsec_taskpool_wait(tp)
+        ctx._in_runtime += 1
+        try:
+            with nogil:
+                rc = c.parsec_taskpool_wait(tp)
+        finally:
+            ctx._in_runtime -= 1
         if rc < 0:
             raise RuntimeError(f"parsec_taskpool_wait failed ({rc})")
         if self._pending:
@@ -518,6 +590,8 @@ cdef class Taskpool:
     def free(self):
         """Release the taskpool, completing its work first if needed.
         Calling it again does nothing."""
+        if self._tp != NULL and self._context._ctx != NULL:
+            self._context.submit_batch()
         self.release()
 
     cdef int flush_collections(self) except -1:

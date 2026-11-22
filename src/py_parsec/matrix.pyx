@@ -19,7 +19,7 @@ import numpy as np
 cimport numpy as cnp
 
 from py_parsec cimport cparsec as c
-from py_parsec.runtime cimport Context, Taskpool
+from py_parsec.runtime cimport Context, Taskpool, make_collection_release
 
 cnp.import_array()
 
@@ -87,6 +87,8 @@ cdef class TiledMatrix:
         self.uid = _next_uid
         _next_uid += 1
         self._desc = NULL
+        self._storage = NULL
+        self._free_storage = NULL
         self._context = None
         self._dtd_registered = False
         self._dtd_used_by = 0
@@ -94,12 +96,15 @@ cdef class TiledMatrix:
 
     def __dealloc__(self):
         # Taskpools keep the matrices their tasks use alive, so nothing refers
-        # to the storage any more. Once the context is finalized, fini() has
-        # already released every matrix.
+        # to the data any more. Nothing here calls PaRSEC: the release is queued
+        # on the context. Once the context is finalized, fini() has already
+        # released the PaRSEC side, and only the storage is left to free.
         if self._desc != NULL and self._context is not None and self._context._ctx != NULL:
-            self.dtd_unregister()
-            self.destroy()
+            self._context.defer(make_collection_release(self._desc, self._dtd_registered,
+                                                        self._storage, self._free_storage))
+            self._storage = NULL
         self._desc = NULL
+        self.free_storage()
 
     cdef parsec_tiled_matrix_t *ptr(self) except NULL:
         if self._desc == NULL:
@@ -121,19 +126,31 @@ cdef class TiledMatrix:
             self._dtd_registered = False
         self._dtd_used_by = 0
 
-    cdef destroy(self):
-        c.parsec_tiled_matrix_destroy(self._desc)
+    cdef detach(self):
+        """Release the PaRSEC side of the matrix, keeping its storage."""
+        if self._desc != NULL:
+            c.pyparsec_tiled_matrix_free(self._desc, self._dtd_registered)
+            self._desc = NULL
+            self._dtd_registered = False
+            self._dtd_used_by = 0
+
+    cdef free_storage(self):
+        if self._storage != NULL:
+            self._free_storage(self._storage)
+            self._storage = NULL
+
+    def _detach(self):
+        # Context.fini(): the tile arrays taken from a matrix that is still
+        # referenced stay valid until the matrix object goes away.
+        self.detach()
 
     def release(self):
-        """Free the matrix storage; tile arrays obtained earlier become invalid.
-
-        Release a matrix only once no taskpool that uses it has work left.
-        """
-        if self._desc == NULL:
-            return
-        self.dtd_unregister()
-        self.destroy()
-        self._desc = NULL
+        """Free the matrix and its storage; tile arrays obtained earlier
+        become invalid. Release a matrix only once no taskpool that uses it
+        has work left. Otherwise the matrix is freed when it is no longer
+        referenced (its tile arrays refer to it)."""
+        self.detach()
+        self.free_storage()
 
     @property
     def released(self):
@@ -282,6 +299,7 @@ cdef class BlockCyclic(TiledMatrix):
 
         self._bc = NULL
         context.ptr()
+        self._context = context
         if m < 0 or n < 0 or mb <= 0 or nb <= 0:
             raise ValueError("matrix and tile sizes must be positive")
         p = _default_grid(nodes) if P is None else P
@@ -302,33 +320,22 @@ cdef class BlockCyclic(TiledMatrix):
         c.parsec_matrix_block_cyclic_init(self._bc, <c.parsec_matrix_type_t>mtype, c.PARSEC_MATRIX_TILE,
                                           context.rank, mb, nb, m, n, 0, 0, m, n,
                                           p, q, kp, kq, ip, jq)
-        self._desc = &self._bc.super
+        self._desc = &self._bc.super    # owns _bc (the descriptor starts the structure)
         c.parsec_data_collection_set_key(&self._desc.super, self._name)
-        self._context = context
 
         nbytes = <size_t>self._desc.nb_local_tiles * self._desc.bsiz * c.pyparsec_sizeof_matrix_type(mtype)
         if nbytes > 0:
-            self._bc.mat = c.parsec_data_allocate(nbytes)
-            if self._bc.mat == NULL:
+            # PaRSEC's allocator (devices may make it allocate pinned memory),
+            # and the matching deallocator, kept for when the storage outlives
+            # the runtime.
+            self._free_storage = c.parsec_data_free
+            self._storage = c.parsec_data_allocate(nbytes)
+            if self._storage == NULL:
                 self.release()
                 raise MemoryError(f"cannot allocate {nbytes} bytes for {name}")
-            memset(self._bc.mat, 0, nbytes)
+            memset(self._storage, 0, nbytes)
+            self._bc.mat = self._storage
         context.register_collection(self)
-
-    def __dealloc__(self):
-        # TiledMatrix.__dealloc__ runs next and calls destroy() while _bc is
-        # still set; a matrix whose construction failed only has _bc.
-        if self._desc == NULL and self._bc != NULL:
-            free(self._bc)
-            self._bc = NULL
-
-    cdef destroy(self):
-        if self._bc.mat != NULL:
-            c.parsec_data_free(self._bc.mat)
-            self._bc.mat = NULL
-        TiledMatrix.destroy(self)
-        free(self._bc)
-        self._bc = NULL
 
 
 cdef _check_redistribute(TiledMatrix source, TiledMatrix target):
@@ -386,8 +393,10 @@ def redistribute_dtd(Context context not None, TiledMatrix source not None, Tile
     context.wait()
     source.dtd_unregister()
     target.dtd_unregister()
+    context._in_runtime += 1
     with nogil:
         rc = c.parsec_redistribute_dtd(ctx, src, dst, rows, cols,
                                        disi_source, disj_source, disi_target, disj_target)
+    context._in_runtime -= 1
     if rc != c.PARSEC_SUCCESS:
         raise RuntimeError(f"parsec_redistribute_dtd failed ({rc})")

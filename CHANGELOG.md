@@ -22,7 +22,9 @@ an installed PaRSEC.
   of bodies raised by the next wait.
 - Lifetimes: the context keeps taskpools until their work completes;
   finalizers never call PaRSEC, releases are deferred to the next runtime
-  call from the application.
+  call from the thread that created the context, outside of calls that may
+  run tasks. `insert_tasks` behaves exactly like a loop of `insert_task`,
+  also when its iterable inserts, flushes or waits.
 - Import fails with a clear message when the loaded `libparsec` is not the
   build the extension modules were compiled against, and the modules are
   rebuilt when that PaRSEC changes.
@@ -52,5 +54,10 @@ Changes from the version reviewed in ICLDisco/parsec#834:
 - All exceptions raised by bodies are reported (the first is raised with a
   note counting the others).
 - A second `Context` raises an error instead of crashing in `parsec_init`.
+- Matrices are released like taskpools (never from a finalizer), and their
+  storage outlives the context while tile arrays refer to it, so results can
+  be read after a `with` block.
+- Saved exceptions of task bodies no longer keep the body's locals, which
+  are arrays over data copies that do not outlive the task.
 - The GEMM example verifies correctly when the matrix size is not a multiple
   of the tile size.

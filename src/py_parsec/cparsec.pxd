@@ -130,9 +130,12 @@ cdef extern from "parsec/data_dist/matrix/two_dim_rectangle_cyclic.h" nogil:
                                          int ip, int jq)
 
 
-cdef extern from "parsec/data.h" nogil:
-    void *parsec_data_allocate(size_t size)
-    void parsec_data_free(void *ptr)
+cdef extern from "parsec/runtime.h" nogil:
+    # Global function pointers, which devices may replace (pinned memory).
+    ctypedef void *(*parsec_data_allocate_t)(size_t size) noexcept nogil
+    ctypedef void (*parsec_data_free_t)(void *ptr) noexcept nogil
+    parsec_data_allocate_t parsec_data_allocate
+    parsec_data_free_t parsec_data_free
 
 
 cdef extern from "parsec/interfaces/dtd/insert_function.h" nogil:
@@ -170,7 +173,13 @@ cdef extern from "pyparsec.h" nogil:
     int pyparsec_dtd_insert(parsec_taskpool_t *tp, parsec_task_class_t *tc,
                             int priority, int device_type,
                             int nb_args, const int *flags, void * const *ptrs)
+    int pyparsec_dtd_insert_tiles(parsec_taskpool_t *tp, parsec_task_class_t *tc,
+                                  int priority, int device_type, int nb_args,
+                                  const int *flags, void **ptrs,
+                                  parsec_data_collection_t * const *dcs,
+                                  const parsec_data_key_t *keys)
     int pyparsec_dtd_unpack(parsec_task_t *task, int nb_args, void * const *outs)
+    void pyparsec_tiled_matrix_free(parsec_tiled_matrix_t *desc, int dtd_registered)
     parsec_task_class_t *pyparsec_dtd_create_task_class(const char *name, int nb_params,
                                                         const int *sizes, const int *ops)
     parsec_hook_return_t pyparsec_noop_chore(parsec_execution_stream_t *es, parsec_task_t *task)

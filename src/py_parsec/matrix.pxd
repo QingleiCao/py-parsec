@@ -5,7 +5,7 @@
 from libc.stdint cimport uint64_t
 
 from py_parsec.cparsec cimport (parsec_data_collection_t, parsec_tiled_matrix_t,
-                                parsec_matrix_block_cyclic_t)
+                                parsec_matrix_block_cyclic_t, parsec_data_free_t)
 from py_parsec.runtime cimport Context
 
 
@@ -14,7 +14,9 @@ cdef object host_array(void *ptr, int mb, int nb, int typenum, int itemsize,
 
 
 cdef class TiledMatrix:
-    cdef parsec_tiled_matrix_t *_desc
+    cdef parsec_tiled_matrix_t *_desc     # allocated with calloc(); NULL once released
+    cdef void *_storage                   # the local tiles, owned by this object
+    cdef parsec_data_free_t _free_storage # the deallocator matching their allocator
     cdef Context _context
     cdef bytes _name
     cdef readonly object dtype
@@ -33,7 +35,8 @@ cdef class TiledMatrix:
     cdef int check_tile(self, int m, int n) except -1
     cdef dtd_register(self)
     cdef dtd_unregister(self)
-    cdef destroy(self)
+    cdef detach(self)
+    cdef free_storage(self)
 
 
 cdef class BlockCyclic(TiledMatrix):

@@ -122,7 +122,12 @@ matrices to such C code.
 A taskpool can be dropped at any time: the context keeps it until a wait has
 completed its work, and it is released afterwards. `tp.free()` completes and
 releases it right away. No PaRSEC function is ever called from a Python
-finalizer.
+finalizer: taskpools and matrices collected by Python are released by the
+next call into the runtime from the thread that created the context.
+
+Drive the runtime (insertions, flushes, waits, frees) from one thread,
+normally the one that created the context. Task bodies run on PaRSEC threads
+and must not call these functions.
 
 ### Matrices
 
@@ -131,7 +136,11 @@ a 2D block-cyclic tiled matrix (float32, float64, complex64, complex128,
 int32, int8 or uint8) over a `P x Q` process grid. Its local tiles are
 allocated and zeroed; `A.tile(m, n)` and `A.local_tiles()` give them as
 `(mb, nb)` Fortran-ordered NumPy arrays that share the PaRSEC storage. The
-same matrix can be used by DTD and PTG taskpools.
+same matrix can be used by DTD and PTG taskpools. A matrix and its storage
+live as long as the matrix object or one of its tile arrays; `A.release()`
+frees them earlier. Once the context is finalized, the tile arrays still
+hold their data (to read results after a `with` block), but the matrix can
+no longer be used by tasks.
 
 ### DTD
 
@@ -148,7 +157,10 @@ Q f d`.
   insertion only, such as `dtd.PUSHOUT`) or `dtd.tile_of(A, m, n)`.
 - `tp.insert_tasks(tc, tasks)` inserts one task per argument tuple of an
   iterable, in batches, without taking the GIL back between the tasks of a
-  batch (see Performance).
+  batch (see Performance). It is equivalent to a loop of `insert_task`: if
+  the iterable inserts other tasks, flushes or waits, the tasks it produced
+  before are inserted first, and if it raises, the tasks before the failing
+  item are inserted.
 - `tc.add_chore(py_parsec.DEV_CPU, body)` adds a Python body. It is called
   with one argument per parameter: NumPy arrays for tiles (read-only for
   `INPUT`), numbers for values. The arrays are only valid during the call.

@@ -46,10 +46,12 @@ the context.
 """
 
 import ctypes
+import traceback
 import weakref
 
 cimport cython
 from cpython.object cimport PyObject
+from cpython.pythread cimport PyThread_get_thread_ident
 from cpython.ref cimport Py_INCREF
 from cpython.tuple cimport PyTuple_New, PyTuple_SET_ITEM
 from libc.stdint cimport int8_t, uint8_t, int16_t, uint16_t, int64_t, uint64_t, uintptr_t
@@ -59,7 +61,7 @@ import numpy as np
 
 from py_parsec cimport cparsec as c
 from py_parsec.matrix cimport TiledMatrix, host_array
-from py_parsec.runtime cimport Context, make_release
+from py_parsec.runtime cimport Context, PendingBatch, make_release
 from py_parsec.runtime cimport Taskpool as BaseTaskpool
 from py_parsec.runtime import address_of
 from py_parsec.matrix import matrix_type
@@ -493,7 +495,8 @@ cdef class TaskClass:
                 _table_remove(self._tc)
                 self._in_table = False
             if self._devices == 0:
-                # Never registered in the taskpool: DTD cannot release it.
+                # Never registered in the taskpool: release it on its own.
+                c.parsec_dtd_task_class_release(tp._tp, self._tc)
                 self._tc = NULL
             raise RuntimeError(f"cannot add a chore for device {device_type:#x} to {self.name} ({rc})")
         self._devices |= device_type
@@ -531,6 +534,12 @@ cdef class TaskClass:
             raise ValueError(f"the body of {self.name} returned {rc}: only HOOK_RETURN_DONE "
                              "and HOOK_RETURN_AGAIN are accepted")
         except BaseException as e:
+            # The frames of the body refer to its arguments, arrays over data
+            # copies that do not outlive the task: drop their locals.
+            try:
+                traceback.clear_frames(e.__traceback__)
+            except Exception:
+                pass
             if self._errors is None:
                 self._errors = []
             if len(self._errors) < _MAX_KEPT_ERRORS:
@@ -659,9 +668,12 @@ cdef class Taskpool(BaseTaskpool):
     @cython.boundscheck(False)
     @cython.wraparound(False)
     cdef int convert(self, Context ctx, TaskClass tc, tuple args, int *flags, void **ptrs,
-                     uint64_t *values, PyObject **matrices, c.parsec_data_key_t *keys) except -1:
-        """Check and convert the arguments of one task. No DTD tile is
-        created here: one left behind by a failed insertion could not be flushed."""
+                     uint64_t *values, c.parsec_data_collection_t **dcs, c.parsec_data_key_t *keys,
+                     PyObject **matrices) except -1:
+        """Check and convert the arguments of one task. No DTD tile is looked
+        up here: that happens right before the insertion, in C, so that no
+        Python code (conversions run __index__ and __float__) runs between
+        them."""
         cdef int i, m, n, tflags, op, write_flows = 0
         cdef bint affinity = tc._placed
         cdef Data d
@@ -680,6 +692,7 @@ cdef class Taskpool(BaseTaskpool):
                     raise IndexError(f"argument {i} of {tc.name}: tile ({m}, {n}) outside the "
                                      f"{desc.mt}x{desc.nt} tiles of {matrix.name}")
                 keys[i] = c.pyparsec_data_key(&desc.super, m, n)
+                dcs[i] = &desc.super
                 matrices[i] = <PyObject *>matrix
                 flags[i] = tflags
                 if not affinity:
@@ -691,28 +704,29 @@ cdef class Taskpool(BaseTaskpool):
                 (<Value>tc.params[i]).store(args[i], &values[i])
                 ptrs[i] = &values[i]
                 flags[i] = 0
+                dcs[i] = NULL
                 matrices[i] = NULL
         if not affinity and write_flows and ctx.nb_nodes > 1:
             raise ValueError(f"task class {tc.name} writes a tile but no parameter has AFFINITY: "
                              "a task that writes data must be placed in a distributed run")
         return 0
 
-    cdef int bind_tiles(self, TaskClass tc, void **ptrs, PyObject **matrices,
-                        c.parsec_data_key_t *keys) except -1:
-        """Look up the DTD tiles of a converted task, recording the
-        collections used since their last flush."""
+    cdef int mark_used(self, int nargs, PyObject **matrices) except -1:
+        """Record the collections of a converted task as used since their
+        last flush (and give them a DTD tile table)."""
         cdef int i
         cdef TiledMatrix matrix
-        for i in range(tc.nparams):
+        for i in range(nargs):
             if matrices[i] != NULL:
                 matrix = <TiledMatrix>matrices[i]
+                if matrix._desc == NULL:
+                    raise RuntimeError(f"matrix {matrix.name} was released before its tasks were inserted")
                 if not matrix._dtd_registered:
                     matrix.dtd_register()
                 if matrix._dtd_used_by != self.uid or matrix._dtd_used_epoch != self._epoch:
                     self._collections[matrix] = True
                     matrix._dtd_used_by = self.uid
                     matrix._dtd_used_epoch = self._epoch
-                ptrs[i] = c.parsec_dtd_tile_of(&matrix._desc.super, keys[i])
         return 0
 
     def insert_task(self, TaskClass tc not None, *args, int priority=0, int device=c.PARSEC_DEV_ALL):
@@ -725,19 +739,28 @@ cdef class Taskpool(BaseTaskpool):
         cdef int flags[c.PYPARSEC_MAX_PARAMS]
         cdef void *ptrs[c.PYPARSEC_MAX_PARAMS]
         cdef uint64_t values[c.PYPARSEC_MAX_PARAMS]
-        cdef PyObject *matrices[c.PYPARSEC_MAX_PARAMS]
+        cdef c.parsec_data_collection_t *dcs[c.PYPARSEC_MAX_PARAMS]
         cdef c.parsec_data_key_t keys[c.PYPARSEC_MAX_PARAMS]
+        cdef PyObject *matrices[c.PYPARSEC_MAX_PARAMS]
         cdef Context ctx = self.check_insert(tc, len(args), device)
-        cdef c.parsec_taskpool_t *tp = self._tp
-        cdef c.parsec_task_class_t *ctc = tc._tc
+        cdef c.parsec_taskpool_t *tp
+        cdef c.parsec_task_class_t *ctc
         cdef int nargs = tc.nparams
 
-        self.convert(ctx, tc, args, flags, ptrs, values, matrices, keys)
-        self.bind_tiles(tc, ptrs, matrices, keys)
+        if ctx._batch is not None:
+            ctx.submit_batch()
+        self.convert(ctx, tc, args, flags, ptrs, values, dcs, keys, matrices)
+        tp = self.ptr()
+        ctc = tc._tc
+        if ctc == NULL:
+            raise RuntimeError(f"task class {tc.name} has been released")
+        self.mark_used(nargs, matrices)
         if not c.pyparsec_context_is_active(ctx._ctx):
             ctx.ensure_started()
+        ctx._in_runtime += 1
         with nogil:
-            c.pyparsec_dtd_insert(tp, ctc, priority, device, nargs, flags, ptrs)
+            c.pyparsec_dtd_insert_tiles(tp, ctc, priority, device, nargs, flags, ptrs, dcs, keys)
+        ctx._in_runtime -= 1
         if not self._pending:
             self.mark_pending()
 
@@ -748,66 +771,42 @@ cdef class Taskpool(BaseTaskpool):
         Arguments are converted in batches, and each batch is inserted
         without taking the GIL back between tasks. This is faster than a loop
         of :meth:`insert_task` when Python bodies of other tasks compete for
-        the GIL. Returns the number of tasks inserted.
+        the GIL, and equivalent to it: the tasks of an iterable that fails
+        are inserted up to the failing item, and an insertion, flush, wait or
+        free made by the iterable itself first inserts the tasks it produced
+        before. Returns the number of tasks inserted.
         """
-        cdef Context ctx = self.check_insert(tc, tc.nparams, device)
-        cdef c.parsec_taskpool_t *tp = self._tp
-        cdef c.parsec_task_class_t *ctc = tc._tc
-        cdef int nargs = tc.nparams, stride = max(nargs, 1)
-        cdef int *flags = NULL
-        cdef void **ptrs = NULL
-        cdef uint64_t *values = NULL
-        cdef PyObject *matrices[c.PYPARSEC_MAX_PARAMS]
+        cdef int flags[c.PYPARSEC_MAX_PARAMS]
+        cdef void *ptrs[c.PYPARSEC_MAX_PARAMS]
+        cdef uint64_t values[c.PYPARSEC_MAX_PARAMS]
+        cdef c.parsec_data_collection_t *dcs[c.PYPARSEC_MAX_PARAMS]
         cdef c.parsec_data_key_t keys[c.PYPARSEC_MAX_PARAMS]
-        cdef Py_ssize_t count = 0, j, k, batched = 0
+        cdef PyObject *matrices[c.PYPARSEC_MAX_PARAMS]
+        cdef Context ctx = self.check_insert(tc, tc.nparams, device)
+        cdef int nargs = tc.nparams
+        cdef PendingBatch outer
+        cdef _Batch batch
 
-        flags = <int *>calloc(_BATCH * stride, sizeof(int))
-        ptrs = <void **>calloc(_BATCH * stride, sizeof(void *))
-        values = <uint64_t *>calloc(_BATCH * stride, sizeof(uint64_t))
+        ctx.submit_batch()      # the batch of an enclosing insert_tasks()
+        batch = _Batch.create(ctx, self, tc, priority, device)
+        outer = ctx._batch
+        ctx._batch = batch
         try:
-            if flags == NULL or ptrs == NULL or values == NULL:
-                raise MemoryError()
-            it = iter(tasks)
-            done = False
-            while not done:
-                batched = 0
-                error = None
-                try:
-                    for item in it:
-                        args = item if type(item) is tuple else tuple(item)
-                        if len(<tuple>args) != nargs:
-                            raise TypeError(f"task class {tc.name} takes {nargs} arguments, "
-                                            f"{len(<tuple>args)} given (task {count + batched})")
-                        j = batched * stride
-                        self.convert(ctx, tc, <tuple>args, &flags[j], &ptrs[j], &values[j], matrices, keys)
-                        self.bind_tiles(tc, &ptrs[j], matrices, keys)
-                        batched += 1
-                        if batched == _BATCH:
-                            break
-                    else:
-                        done = True
-                except BaseException as e:
-                    # The tasks converted before the failing one are inserted:
-                    # their DTD tiles are already looked up.
-                    error = e
-                    done = True
-                if batched:
-                    if not c.pyparsec_context_is_active(ctx._ctx):
-                        ctx.ensure_started()
-                    with nogil:
-                        for k in range(batched):
-                            c.pyparsec_dtd_insert(tp, ctc, priority, device, nargs,
-                                                  &flags[k * stride], &ptrs[k * stride])
-                    count += batched
-                    if not self._pending:
-                        self.mark_pending()
-                if error is not None:
-                    raise error
+            try:
+                for item in tasks:
+                    args = item if type(item) is tuple else tuple(item)
+                    if len(<tuple>args) != nargs:
+                        raise TypeError(f"task class {tc.name} takes {nargs} arguments, "
+                                        f"{len(<tuple>args)} given (task {batch.inserted + batch.count})")
+                    self.convert(ctx, tc, <tuple>args, flags, ptrs, values, dcs, keys, matrices)
+                    batch.add(<tuple>args, flags, values, dcs, keys, matrices)
+            except BaseException:
+                batch.submit()  # the tasks converted before the failing one
+                raise
+            batch.submit()
         finally:
-            free(flags)
-            free(ptrs)
-            free(values)
-        return count
+            ctx._batch = outer
+        return batch.inserted
 
     cdef c.parsec_dtd_tile_t *dtd_tile(self, TiledMatrix matrix, int m, int n) except NULL:
         matrix.check_tile(m, n)
@@ -829,10 +828,13 @@ cdef class Taskpool(BaseTaskpool):
             matrix, m, n = tile
         else:
             raise TypeError("data_flush takes (matrix, m, n) or tile_of(...)")
+        ctx.submit_batch()
         dtile = self.dtd_tile(matrix, m, n)
         ctx.ensure_started()
+        ctx._in_runtime += 1
         with nogil:
             c.parsec_dtd_data_flush(tp, dtile)
+        ctx._in_runtime -= 1
         self.mark_pending()
 
     def data_flush_all(self, TiledMatrix matrix not None):
@@ -842,11 +844,14 @@ cdef class Taskpool(BaseTaskpool):
         cdef c.parsec_taskpool_t *tp = self.ptr()
         cdef Context ctx = self.enqueued_context()
         cdef c.parsec_data_collection_t *dc
+        ctx.submit_batch()
         matrix.dtd_register()
         dc = matrix.dc()
         ctx.ensure_started()
+        ctx._in_runtime += 1
         with nogil:
             c.parsec_dtd_data_flush_all(tp, dc)
+        ctx._in_runtime -= 1
         self._collections[matrix] = False
         if matrix._dtd_used_by == self.uid:
             matrix._dtd_used_by = 0
@@ -879,3 +884,110 @@ cdef class Taskpool(BaseTaskpool):
         BaseTaskpool.forget(self)
         # The collections are kept alive until no task can refer to them.
         self._collections = {}
+
+
+@cython.final
+cdef class _Batch(PendingBatch):
+    """The tasks an insert_tasks() call has converted and not inserted yet."""
+
+    cdef Context ctx
+    cdef Taskpool tp
+    cdef TaskClass tc
+    cdef int nargs
+    cdef int stride
+    cdef int priority
+    cdef int device
+    cdef Py_ssize_t count
+    cdef Py_ssize_t inserted
+    cdef int *flags
+    cdef void **ptrs
+    cdef uint64_t *values
+    cdef c.parsec_data_collection_t **dcs
+    cdef c.parsec_data_key_t *keys
+    cdef PyObject **matrices    # borrowed from the argument tuples in args
+    cdef list args
+
+    @staticmethod
+    cdef _Batch create(Context ctx, Taskpool tp, TaskClass tc, int priority, int device):
+        cdef _Batch b = _Batch.__new__(_Batch)
+        cdef size_t n
+        b.ctx = ctx
+        b.tp = tp
+        b.tc = tc
+        b.nargs = tc.nparams
+        b.stride = max(tc.nparams, 1)
+        b.priority = priority
+        b.device = device
+        b.thread = PyThread_get_thread_ident()
+        b.args = []
+        n = <size_t>_BATCH * b.stride
+        b.flags = <int *>calloc(n, sizeof(int))
+        b.ptrs = <void **>calloc(n, sizeof(void *))
+        b.values = <uint64_t *>calloc(n, sizeof(uint64_t))
+        b.dcs = <c.parsec_data_collection_t **>calloc(n, sizeof(c.parsec_data_collection_t *))
+        b.keys = <c.parsec_data_key_t *>calloc(n, sizeof(c.parsec_data_key_t))
+        b.matrices = <PyObject **>calloc(n, sizeof(PyObject *))
+        if (b.flags == NULL or b.ptrs == NULL or b.values == NULL or b.dcs == NULL
+                or b.keys == NULL or b.matrices == NULL):
+            raise MemoryError()
+        return b
+
+    def __dealloc__(self):
+        free(self.flags)
+        free(self.ptrs)
+        free(self.values)
+        free(self.dcs)
+        free(self.keys)
+        free(self.matrices)
+
+    cdef int add(self, tuple args, int *flags, uint64_t *values,
+                 c.parsec_data_collection_t **dcs, c.parsec_data_key_t *keys,
+                 PyObject **matrices) except -1:
+        """Append one converted task, inserting the batch once it is full."""
+        cdef Py_ssize_t j = self.count * self.stride
+        cdef int i
+        for i in range(self.nargs):
+            self.flags[j + i] = flags[i]
+            self.dcs[j + i] = dcs[i]
+            self.keys[j + i] = keys[i]
+            self.matrices[j + i] = matrices[i]
+            self.values[j + i] = values[i]
+            self.ptrs[j + i] = &self.values[j + i] if dcs[i] == NULL else NULL
+        self.args.append(args)
+        self.count += 1
+        if self.count == _BATCH:
+            self.submit()
+        return 0
+
+    cdef int submit(self) except -1:
+        cdef Py_ssize_t n = self.count, k
+        cdef int s = self.stride
+        cdef Taskpool tp = self.tp
+        cdef Context ctx = self.ctx
+        cdef c.parsec_taskpool_t *ptp
+        cdef c.parsec_task_class_t *ctc
+        if n == 0:
+            return 0
+        self.count = 0          # whatever happens, these tasks are not submitted twice
+        held = self.args        # keeps the matrices alive until they are inserted
+        self.args = []
+        ptp = tp.ptr()
+        ctc = self.tc._tc
+        if ctc == NULL:
+            raise RuntimeError(f"task class {self.tc.name} has been released")
+        for k in range(n):
+            tp.mark_used(self.nargs, &self.matrices[k * s])
+        if not c.pyparsec_context_is_active(ctx._ctx):
+            ctx.ensure_started()
+        ctx._in_runtime += 1
+        with nogil:
+            for k in range(n):
+                c.pyparsec_dtd_insert_tiles(ptp, ctc, self.priority, self.device, self.nargs,
+                                            &self.flags[k * s], &self.ptrs[k * s],
+                                            &self.dcs[k * s], &self.keys[k * s])
+        ctx._in_runtime -= 1
+        self.inserted += n
+        if not tp._pending:
+            tp.mark_pending()
+        del held
+        return 0

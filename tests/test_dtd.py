@@ -457,3 +457,123 @@ def test_context_wait_with_idle_taskpools(ctx, tp):
     tp.insert_task(tc, (A, 0, 0))
     ctx.wait()
     other.free()
+
+
+def test_insert_tasks_iterable_inserting_keeps_order(ctx, tp):
+    """Tasks inserted by the iterable of insert_tasks() come after the tasks
+    it produced before: the result is that of the sequential loop."""
+    A = py_parsec.BlockCyclic(ctx, 4, 4, 4, 4)
+    inc = tp.task_class("inc", dtd.Data(dtd.INOUT | dtd.AFFINITY, A))
+    dbl = tp.task_class("dbl", dtd.Data(dtd.INOUT | dtd.AFFINITY, A))
+    inc.add_chore(py_parsec.DEV_CPU, lambda a: a.__iadd__(1))
+    dbl.add_chore(py_parsec.DEV_CPU, lambda a: a.__imul__(2))
+
+    def tasks():
+        for _ in range(4):
+            yield ((A, 0, 0),)
+            tp.insert_task(dbl, (A, 0, 0))
+
+    assert tp.insert_tasks(inc, tasks()) == 4
+    tp.wait()
+    assert_matches(A, np.full((4, 4), 30.0))     # ((((0+1)*2+1)*2+1)*2+1)*2
+
+
+def test_insert_tasks_iterable_waiting(ctx, tp):
+    """A wait made by the iterable completes the tasks it produced before
+    (a distributed run would not terminate if their tiles were dropped)."""
+    last = ctx.nb_nodes - 1
+    A = py_parsec.BlockCyclic(ctx, 4, 4, 4, 4, P=ctx.nb_nodes, name="A")
+    B = py_parsec.BlockCyclic(ctx, 4 * ctx.nb_nodes, 4, 4, 4, P=ctx.nb_nodes, name="B")
+    inc = tp.task_class("inc", dtd.Data(dtd.INPUT | dtd.AFFINITY, B), dtd.Data(dtd.INOUT, A))
+    inc.add_chore(py_parsec.DEV_CPU, lambda b, a: a.__iadd__(1))
+
+    def tasks():
+        for i in range(6):
+            yield ((B, last, 0), (A, 0, 0))
+            if i == 2:
+                tp.wait()
+
+    assert tp.insert_tasks(inc, tasks()) == 6
+    tp.wait()
+    assert_matches(A, np.full((4, 4), 6.0))
+
+
+def test_insert_tasks_nested_and_freed(ctx):
+    A = py_parsec.BlockCyclic(ctx, 8, 8, 4, 4)
+    tp = dtd.Taskpool()
+    ctx.add_taskpool(tp)
+    inc = tp.task_class("inc", dtd.Data(dtd.INOUT | dtd.AFFINITY, A))
+    inc.add_chore(py_parsec.DEV_CPU, lambda a: a.__iadd__(1))
+
+    def inner():
+        yield ((A, 1, 1),)
+
+    def outer():
+        yield ((A, 0, 0),)
+        tp.insert_tasks(inc, inner())
+        yield ((A, 0, 0),)
+
+    assert tp.insert_tasks(inc, outer()) == 2
+    tp.wait()
+    expected = np.zeros((8, 8))
+    expected[:4, :4] = 2
+    expected[4:, 4:] = 1
+    assert_matches(A, expected)
+
+    def freeing():
+        yield ((A, 0, 0),)
+        tp.free()
+        yield ((A, 0, 0),)
+
+    with pytest.raises(RuntimeError, match="released"):
+        tp.insert_tasks(inc, freeing())
+    expected[:4, :4] = 3     # the task before free() was inserted and completed
+    assert_matches(A, expected)
+
+
+def test_drop_taskpool_during_context_wait(ctx):
+    """A taskpool dropped and a matrix created by a body while the context
+    waits: the release is not run from the body's thread or during the wait."""
+    idle = dtd.Taskpool()
+    ctx.add_taskpool(idle)
+    idle.wait()
+    holder = [idle]
+    del idle
+    tp = dtd.Taskpool()
+    ctx.add_taskpool(tp)
+    A = py_parsec.BlockCyclic(ctx, 4, 4, 4, 4)
+
+    def body(a):
+        if holder:
+            holder.clear()
+            py_parsec.BlockCyclic(ctx, 4, 4, 4, 4)
+        a += 1
+
+    tc = tp.task_class("inc", dtd.Data(dtd.INOUT | dtd.AFFINITY, A))
+    tc.add_chore(py_parsec.DEV_CPU, body)
+    for _ in range(5):
+        tp.insert_task(tc, (A, 0, 0))
+    ctx.wait()
+    assert_matches(A, np.full((4, 4), 5.0))
+    tp.free()
+
+
+def test_stored_exception_has_no_locals(ctx, tp):
+    A = py_parsec.BlockCyclic(ctx, 4, 4, 4, 4)
+    tc = tp.task_class("boom", dtd.Data(dtd.INOUT | dtd.AFFINITY, A))
+
+    def body(tile):
+        raise KeyError("boom")
+
+    tc.add_chore(py_parsec.DEV_CPU, body)
+    tp.insert_task(tc, (A, 0, 0))
+    if A.is_local(0, 0):
+        with pytest.raises(KeyError) as info:
+            tp.wait()
+        tb = info.value.__traceback__
+        while tb.tb_next is not None:
+            tb = tb.tb_next
+        assert tb.tb_frame.f_code.co_name == "body"
+        assert "tile" not in tb.tb_frame.f_locals
+    else:
+        tp.wait()

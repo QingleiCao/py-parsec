@@ -20,6 +20,7 @@
 
 #include <Python.h>
 #include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "parsec.h"
@@ -149,6 +150,21 @@ pyparsec_dtd_insert(parsec_taskpool_t *tp, parsec_task_class_t *tc,
     case n:                                                                       \
         (parsec_dtd_unpack_args)(task, PYPARSEC_ARGS_##n(PYPARSEC_UNPACK_OUT) (void *)0); \
         return 0;
+
+/* Look up the DTD tile of every data argument (dcs[i] != NULL), then insert
+ * the task: no Python code can run between the look-up and the insertion. */
+static inline int
+pyparsec_dtd_insert_tiles(parsec_taskpool_t *tp, parsec_task_class_t *tc,
+                          int priority, int device_type, int nb_args,
+                          const int *flags, void **ptrs,
+                          parsec_data_collection_t *const *dcs,
+                          const parsec_data_key_t *keys)
+{
+    for( int i = 0; i < nb_args; i++ ) {
+        if( NULL != dcs[i] ) ptrs[i] = parsec_dtd_tile_of(dcs[i], keys[i]);
+    }
+    return pyparsec_dtd_insert(tp, tc, priority, device_type, nb_args, flags, ptrs);
+}
 
 /* Unpack the first nb_args parameters of a DTD task into outs. */
 static inline int
@@ -282,6 +298,17 @@ pyparsec_local_tile(parsec_data_collection_t *dc, int m, int n)
     if( NULL == data ) return NULL;
     copy = parsec_data_get_copy(data, 0);
     return (NULL == copy) ? NULL : parsec_data_copy_get_ptr(copy);
+}
+
+/* Release the PaRSEC side of a tiled matrix allocated with calloc(): its DTD
+ * tile table if it has one, its data descriptors, and the structure itself.
+ * The storage of the tiles is not touched. */
+static inline void
+pyparsec_tiled_matrix_free(parsec_tiled_matrix_t *desc, int dtd_registered)
+{
+    if( dtd_registered ) parsec_dtd_data_collection_fini(&desc->super);
+    parsec_tiled_matrix_destroy(desc);
+    free(desc);
 }
 
 static inline size_t
