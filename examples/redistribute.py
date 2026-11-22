@@ -29,7 +29,6 @@ def main():
     with py_parsec.Context() as ctx:
         src = py_parsec.BlockCyclic(ctx, M, N, 32, 32, name="src")
         dst = py_parsec.BlockCyclic(ctx, 200, 150, 25, 40, P=1, name="dst")
-        ctx.start()
 
         # 1. DTD: initialize the source.
         fill = dtd.Taskpool()
@@ -44,25 +43,23 @@ def main():
         init.add_chore(py_parsec.DEV_CPU, init_body)
         for m in range(src.mt):
             for n in range(src.nt):
-                fill.insert_task(init, dtd.tile_of(src, m, n), m, n)
-        fill.data_flush_all(src)
+                fill.insert_task(init, (src, m, n), m, n)
+        fill.wait()     # flushes src: its tiles are back on their owners
 
         # 2. PTG: copy the submatrix; enqueued like any other taskpool.
         copy = redistribute_new(src, dst, *SUB, *FROM, *TO)
         ctx.add_taskpool(copy)
-        ctx.wait()
+        copy.wait()
 
         # 3. DTD again, on the target.
-        ctx.start()
         update = dtd.Taskpool()
         ctx.add_taskpool(update)
         negate = update.task_class("negate", dtd.Data(dtd.INOUT | dtd.AFFINITY, dst))
         negate.add_chore(py_parsec.DEV_CPU, lambda tile: np.negative(tile, out=tile))
         for m in range(dst.mt):
             for n in range(dst.nt):
-                update.insert_task(negate, dtd.tile_of(dst, m, n))
-        update.data_flush_all(dst)
-        ctx.wait()
+                update.insert_task(negate, (dst, m, n))
+        ctx.wait()      # completes every taskpool of the context
 
         # Check the tiles this rank owns.
         expected = np.zeros((dst.m, dst.n))

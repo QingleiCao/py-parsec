@@ -21,16 +21,28 @@ def global_matrix():
     return np.arange(M * N, dtype=np.float64).reshape(M, N)
 
 
-def test_redistribute_ptg(ctx):
+def test_redistribute_ptg_context_wait(ctx):
     src = py_parsec.BlockCyclic(ctx, M, N, 8, 8, name="src")
     dst = py_parsec.BlockCyclic(ctx, M, N, 12, 6, P=1, name="dst")
     scatter(src, global_matrix())
     tp = redistribute_new(src, dst)
     ctx.add_taskpool(tp)
-    ctx.start()
     ctx.wait()
     tp.free()
     assert_matches(dst, global_matrix())
+
+
+def test_redistribute_ptg_taskpool_wait(ctx):
+    """parsec_taskpool_wait() on a PTG taskpool, also on a single process."""
+    src = py_parsec.BlockCyclic(ctx, M, N, 8, 8, name="src")
+    dst = py_parsec.BlockCyclic(ctx, M, N, 12, 6, P=1, name="dst")
+    scatter(src, global_matrix())
+    for _ in range(2):
+        tp = redistribute_new(src, dst)
+        ctx.add_taskpool(tp)
+        tp.wait()
+        tp.free()
+        assert_matches(dst, global_matrix())
 
 
 def test_redistribute_ptg_submatrix(ctx):
@@ -47,10 +59,15 @@ def test_redistribute_ptg_submatrix(ctx):
     assert_matches(dst, expected)
 
 
-def test_redistribute_ptg_arguments(ctx):
+def test_redistribute_arguments(ctx):
     src = py_parsec.BlockCyclic(ctx, M, N, 8, 8)
-    with pytest.raises(TypeError, match="dtypes differ"):
-        redistribute_new(src, py_parsec.BlockCyclic(ctx, M, N, 8, 8, dtype=np.float32))
+    single = py_parsec.BlockCyclic(ctx, M, N, 8, 8, dtype=np.float32)
+    with pytest.raises(TypeError, match="float64"):
+        redistribute_new(src, single)
+    with pytest.raises(TypeError, match="float64"):
+        redistribute_new(single, py_parsec.BlockCyclic(ctx, M, N, 8, 8, dtype=np.float32))
+    with pytest.raises(TypeError, match="float64"):
+        redistribute_dtd(ctx, single, single)
     with pytest.raises(ValueError, match="rejected"):
         redistribute_new(src, py_parsec.BlockCyclic(ctx, 10, 10, 8, 8))
 
@@ -64,11 +81,28 @@ def test_redistribute_dtd(ctx):
     assert_matches(dst, global_matrix())
 
 
+def test_redistribute_dtd_completes_pending_work(ctx):
+    """redistribute_dtd first completes the other taskpools of the context,
+    flushing their collections, so their tasks and errors are not lost."""
+    src = py_parsec.BlockCyclic(ctx, M, N, 8, 8, name="src")
+    dst = py_parsec.BlockCyclic(ctx, M, N, 10, 10, P=1, name="dst")
+    scatter(src, global_matrix())
+    tp = dtd.Taskpool()
+    ctx.add_taskpool(tp)
+    twice = tp.task_class("twice", dtd.Data(dtd.INOUT | dtd.AFFINITY, src))
+    twice.add_chore(py_parsec.DEV_CPU, lambda tile: tile.__imul__(2))
+    for m in range(src.mt):
+        for n in range(src.nt):
+            tp.insert_task(twice, (src, m, n))
+    redistribute_dtd(ctx, src, dst)     # no explicit flush or wait of tp
+    assert_matches(dst, 2 * global_matrix())
+    tp.free()
+
+
 def test_dtd_then_ptg_then_dtd(ctx):
     """DTD writes src, a PTG taskpool copies it to dst, DTD scales dst."""
     src = py_parsec.BlockCyclic(ctx, M, N, 8, 8, name="src")
     dst = py_parsec.BlockCyclic(ctx, M, N, 10, 10, P=1, name="dst")
-    ctx.start()
 
     fill = dtd.Taskpool()
     ctx.add_taskpool(fill)
@@ -82,24 +116,20 @@ def test_dtd_then_ptg_then_dtd(ctx):
     init.add_chore(py_parsec.DEV_CPU, init_body)
     for m in range(src.mt):
         for n in range(src.nt):
-            fill.insert_task(init, dtd.tile_of(src, m, n), m, n)
-    fill.data_flush_all(src)
+            fill.insert_task(init, (src, m, n), m, n)
     ctx.wait()
 
     copy = redistribute_new(src, dst)
     ctx.add_taskpool(copy)
-    ctx.start()
     ctx.wait()
 
-    ctx.start()
     scale = dtd.Taskpool()
     ctx.add_taskpool(scale)
     twice = scale.task_class("twice", dtd.Data(dtd.INOUT | dtd.AFFINITY, dst))
     twice.add_chore(py_parsec.DEV_CPU, lambda tile: tile.__imul__(2))
     for m in range(dst.mt):
         for n in range(dst.nt):
-            scale.insert_task(twice, dtd.tile_of(dst, m, n))
-    scale.data_flush_all(dst)
+            scale.insert_task(twice, (dst, m, n))
     ctx.wait()
     for t in (fill, copy, scale):
         t.free()
@@ -107,12 +137,13 @@ def test_dtd_then_ptg_then_dtd(ctx):
 
 
 def test_never_enqueued_taskpool(ctx):
-    """PaRSEC cannot release a PTG taskpool that never ran: it is leaked with a warning."""
+    """A PTG taskpool that never ran can be freed or dropped."""
     src = py_parsec.BlockCyclic(ctx, M, N, 8, 8)
     dst = py_parsec.BlockCyclic(ctx, M, N, 8, 8)
     tp = redistribute_new(src, dst)
-    with pytest.warns(ResourceWarning, match="never enqueued"):
-        tp.free()
+    tp.free()
+    assert tp.released
     dropped = redistribute_new(src, dst)
     del dropped
     gc.collect()
+    ctx.wait()

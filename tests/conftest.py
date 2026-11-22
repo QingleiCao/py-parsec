@@ -5,10 +5,12 @@
 
 The tests run on one process or under an MPI launcher
 (``mpiexec -n 4 python -m pytest``); every rank runs every test, in the same
-order, and checks the tiles it owns. One context serves the whole session.
+order, and checks the tiles it owns. PaRSEC can be initialized once per
+process, so one context serves the whole session.
 """
 
 import os
+import threading
 
 # Task bodies call NumPy from PaRSEC worker threads: keep its BLAS to one
 # thread per call so the ranks do not oversubscribe the cores.
@@ -31,12 +33,23 @@ def ctx():
 
 @pytest.fixture
 def tp(ctx):
-    """A DTD taskpool enqueued in the started session context."""
-    ctx.start()
+    """A DTD taskpool enqueued in the session context."""
     taskpool = dtd.Taskpool()
     ctx.add_taskpool(taskpool)
     yield taskpool
     taskpool.free()
+
+
+class Counter:
+    """A thread-safe call counter for task bodies."""
+
+    def __init__(self):
+        self.value = 0
+        self._lock = threading.Lock()
+
+    def __call__(self, *args):
+        with self._lock:
+            self.value += 1
 
 
 def scatter(matrix, full):

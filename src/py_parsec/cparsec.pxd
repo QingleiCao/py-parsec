@@ -31,9 +31,7 @@ cdef extern from "parsec.h" nogil:
         PARSEC_CONTEXT_QUERY_NODES
         PARSEC_CONTEXT_QUERY_RANK
         PARSEC_CONTEXT_QUERY_DEVICES
-        PARSEC_CONTEXT_QUERY_DEVICES_FULL_PEER_ACCESS
         PARSEC_CONTEXT_QUERY_CORES
-        PARSEC_CONTEXT_QUERY_ACTIVE_TASKPOOLS
 
     enum:
         PARSEC_SUCCESS
@@ -41,13 +39,12 @@ cdef extern from "parsec.h" nogil:
     parsec_context_t *parsec_init(int nb_cores, int *pargc, char ***pargv)
     int parsec_fini(parsec_context_t **pcontext)
     int parsec_version(int *major, int *minor, int *release)
+    int parsec_version_ex(size_t len, char *version_string)
     int parsec_context_start(parsec_context_t *context)
-    int parsec_context_test(parsec_context_t *context)
     int parsec_context_wait(parsec_context_t *context)
     int parsec_context_add_taskpool(parsec_context_t *context, parsec_taskpool_t *tp)
     int parsec_context_query(parsec_context_t *context, parsec_context_query_cmd_t cmd, ...)
     int parsec_taskpool_wait(parsec_taskpool_t *tp)
-    int parsec_taskpool_test(parsec_taskpool_t *tp)
     void parsec_taskpool_free(parsec_taskpool_t *tp)
 
 
@@ -66,7 +63,6 @@ cdef extern from "parsec/data_distribution.h" nogil:
         uint32_t myrank
         uint32_t nodes
     void parsec_data_collection_set_key(parsec_data_collection_t *dc, const char *name)
-    void parsec_data_collection_destroy(parsec_data_collection_t *dc)
 
 
 cdef extern from "parsec/data_dist/matrix/matrix.h" nogil:
@@ -153,9 +149,7 @@ cdef extern from "parsec/interfaces/dtd/insert_function.h" nogil:
         PARSEC_DONT_TRACK
         PARSEC_PUSHOUT
         PARSEC_PULLIN
-        PARSEC_GET_REGION_INFO
         PASSED_BY_REF
-        PARSEC_DTD_MAX_PARAMS
 
     parsec_taskpool_t *parsec_dtd_taskpool_new()
     parsec_dtd_tile_t *parsec_dtd_tile_of(parsec_data_collection_t *dc, parsec_data_key_t key)
@@ -170,17 +164,25 @@ cdef extern from "parsec/interfaces/dtd/insert_function.h" nogil:
 
 
 cdef extern from "pyparsec.h" nogil:
-    void pyparsec_dtd_insert(parsec_taskpool_t *tp, parsec_task_class_t *tc,
-                             int priority, int device_type,
-                             int nb_args, const int *args_flags, void * const *args_ptrs)
-    void pyparsec_dtd_unpack(parsec_task_t *task, int nb_args, void * const *args_out)
+    enum:
+        PYPARSEC_MAX_PARAMS
+
+    int pyparsec_dtd_insert(parsec_taskpool_t *tp, parsec_task_class_t *tc,
+                            int priority, int device_type,
+                            int nb_args, const int *flags, void * const *ptrs)
+    int pyparsec_dtd_unpack(parsec_task_t *task, int nb_args, void * const *outs)
     parsec_task_class_t *pyparsec_dtd_create_task_class(const char *name, int nb_params,
                                                         const int *sizes, const int *ops)
+    parsec_hook_return_t pyparsec_noop_chore(parsec_execution_stream_t *es, parsec_task_t *task)
     const parsec_task_class_t *pyparsec_task_class_of(const parsec_task_t *task)
-    int pyparsec_context_is_active(const parsec_context_t *context)
     int pyparsec_dtd_max_flows()
+    int pyparsec_context_is_active(const parsec_context_t *context)
+    int pyparsec_mpi_finalized()
+    const char *pyparsec_built_date()
+    const char *pyparsec_built_hash()
     parsec_data_key_t pyparsec_data_key(parsec_data_collection_t *dc, int m, int n)
     int pyparsec_rank_of(parsec_data_collection_t *dc, int m, int n)
     void *pyparsec_local_tile(parsec_data_collection_t *dc, int m, int n)
     size_t pyparsec_sizeof_matrix_type(int mtype)
     int pyparsec_dtd_tile_arena_new(parsec_context_t *ctx, int mtype, int mb, int nb, int ld)
+    void pyparsec_keep_thread_state()

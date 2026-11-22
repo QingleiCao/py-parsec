@@ -11,7 +11,7 @@ layout; :meth:`TiledMatrix.tile` exposes a local tile as a writable
 """
 
 cimport cython
-from libc.stdint cimport uintptr_t
+from libc.stdint cimport uint64_t, uintptr_t
 from libc.stdlib cimport calloc, free
 from libc.string cimport memset
 
@@ -33,6 +33,9 @@ _MATRIX_TYPES = {
     np.dtype(np.complex128): c.PARSEC_MATRIX_COMPLEX_DOUBLE,
 }
 
+#: The NumPy dtypes a tiled matrix can hold.
+DTYPES = tuple(_MATRIX_TYPES)
+
 
 def matrix_type(dtype):
     """The ``parsec_matrix_type_t`` matching a NumPy dtype."""
@@ -40,19 +43,31 @@ def matrix_type(dtype):
     try:
         return _MATRIX_TYPES[dt]
     except KeyError:
-        raise TypeError(f"no PaRSEC matrix type for dtype {dt}") from None
+        raise TypeError(f"no PaRSEC matrix type for dtype {dt}; supported: "
+                        f"{', '.join(str(d) for d in DTYPES)}") from None
 
 
-cdef object host_array(void *ptr, int mb, int nb, int typenum, object owner):
-    """An (mb, nb) column-major array over ptr; it keeps owner alive."""
+cdef object host_array(void *ptr, int mb, int nb, int typenum, int itemsize,
+                       bint writeable, object owner):
+    """An (mb, nb) column-major array over ptr, made in one allocation; it
+    keeps owner alive."""
     cdef cnp.npy_intp dims[2]
-    cdef cnp.ndarray arr
-    dims[0] = nb
-    dims[1] = mb
-    arr = cnp.PyArray_SimpleNewFromData(2, dims, typenum, ptr)
+    cdef cnp.npy_intp strides[2]
+    cdef int flags = cnp.NPY_ARRAY_F_CONTIGUOUS | cnp.NPY_ARRAY_ALIGNED
+    if writeable:
+        flags |= cnp.NPY_ARRAY_WRITEABLE
+    dims[0] = mb
+    dims[1] = nb
+    strides[0] = itemsize
+    strides[1] = <cnp.npy_intp>itemsize * mb
+    arr = cnp.PyArray_New(cnp.ndarray, 2, dims, typenum, strides, ptr, itemsize, flags, None)
     if owner is not None:
         cnp.set_array_base(arr, owner)
-    return arr.T
+    return arr
+
+
+# Identifies a matrix for the DTD insertion caches; never reused.
+cdef uint64_t _next_uid = 1
 
 
 def _default_grid(int nodes):
@@ -63,22 +78,28 @@ def _default_grid(int nodes):
     return max(p, 1)
 
 
-@cython.no_gc_clear   # keeps _context until the matrix is released (see runtime.Taskpool)
+@cython.no_gc_clear   # keeps _context until the matrix is released (see runtime.Context)
 cdef class TiledMatrix:
     """Base class of the tiled matrices; see :class:`BlockCyclic`."""
 
     def __cinit__(self, *args, **kwargs):
+        global _next_uid
+        self.uid = _next_uid
+        _next_uid += 1
         self._desc = NULL
         self._context = None
         self._dtd_registered = False
+        self._dtd_used_by = 0
+        self._dtd_used_epoch = 0
 
     def __dealloc__(self):
-        # The matrix holds a reference to its context, so the context is
-        # still initialized here unless fini() already released the matrix.
-        if self._desc != NULL:
+        # Taskpools keep the matrices their tasks use alive, so nothing refers
+        # to the storage any more. Once the context is finalized, fini() has
+        # already released every matrix.
+        if self._desc != NULL and self._context is not None and self._context._ctx != NULL:
             self.dtd_unregister()
             self.destroy()
-            self._desc = NULL
+        self._desc = NULL
 
     cdef parsec_tiled_matrix_t *ptr(self) except NULL:
         if self._desc == NULL:
@@ -98,17 +119,26 @@ cdef class TiledMatrix:
         if self._dtd_registered:
             c.parsec_dtd_data_collection_fini(self.dc())
             self._dtd_registered = False
+        self._dtd_used_by = 0
 
     cdef destroy(self):
         c.parsec_tiled_matrix_destroy(self._desc)
 
     def release(self):
-        """Free the matrix storage; tile arrays obtained earlier become invalid."""
+        """Free the matrix storage; tile arrays obtained earlier become invalid.
+
+        Release a matrix only once no taskpool that uses it has work left.
+        """
         if self._desc == NULL:
             return
         self.dtd_unregister()
         self.destroy()
         self._desc = NULL
+
+    @property
+    def released(self):
+        """True once the storage has been freed."""
+        return self._desc == NULL
 
     @property
     def address(self):
@@ -128,6 +158,11 @@ cdef class TiledMatrix:
     def n(self):
         """Number of columns."""
         return self.ptr().n
+
+    @property
+    def shape(self):
+        """``(m, n)``."""
+        return (self.ptr().m, self.ptr().n)
 
     @property
     def mb(self):
@@ -151,6 +186,7 @@ cdef class TiledMatrix:
 
     @property
     def nb_local_tiles(self):
+        """Number of tiles stored by this process."""
         return self.ptr().nb_local_tiles
 
     @property
@@ -163,7 +199,7 @@ cdef class TiledMatrix:
         """Number of processes the collection is distributed over."""
         return self.ptr().super.nodes
 
-    cdef int _check_tile(self, int m, int n) except -1:
+    cdef int check_tile(self, int m, int n) except -1:
         cdef parsec_tiled_matrix_t *desc = self.ptr()
         if not (0 <= m < desc.mt and 0 <= n < desc.nt):
             raise IndexError(f"tile ({m}, {n}) outside the {desc.mt}x{desc.nt} tiles of {self.name}")
@@ -171,27 +207,33 @@ cdef class TiledMatrix:
 
     def rank_of(self, int m, int n):
         """Rank owning tile (m, n)."""
-        self._check_tile(m, n)
+        self.check_tile(m, n)
         return c.pyparsec_rank_of(self.dc(), m, n)
 
     def is_local(self, int m, int n):
         """True if tile (m, n) is stored by this process."""
         return self.rank_of(m, n) == self.rank
 
+    def tile_shape(self, int m, int n):
+        """Number of rows and columns of tile (m, n) inside the matrix: the
+        tiles of the last row and column may be partly outside of it."""
+        cdef parsec_tiled_matrix_t *desc = self.ptr()
+        self.check_tile(m, n)
+        return (min(desc.mb, desc.m - m * desc.mb), min(desc.nb, desc.n - n * desc.nb))
+
     def tile(self, int m, int n):
         """Local tile (m, n) as an (mb, nb) Fortran-ordered array (no copy).
 
         The array refers to the host copy of the tile: read it once the
-        taskpools writing the tile have completed (and the data has been
-        flushed back for DTD).
+        taskpools writing the tile have completed (after a wait).
         """
         cdef void *ptr
-        self._check_tile(m, n)
+        self.check_tile(m, n)
         ptr = c.pyparsec_local_tile(self.dc(), m, n)
         if ptr == NULL:
             raise ValueError(f"tile ({m}, {n}) of {self.name} is owned by rank "
                              f"{self.rank_of(m, n)}, not by rank {self.rank}")
-        return host_array(ptr, self.ptr().mb, self.ptr().nb, self._typenum, self)
+        return host_array(ptr, self.ptr().mb, self.ptr().nb, self._typenum, self._itemsize, True, self)
 
     def local_tiles(self):
         """Iterate over (m, n, tile array) for the tiles stored by this process."""
@@ -239,16 +281,20 @@ cdef class BlockCyclic(TiledMatrix):
         cdef size_t nbytes
 
         self._bc = NULL
+        context.ptr()
         if m < 0 or n < 0 or mb <= 0 or nb <= 0:
             raise ValueError("matrix and tile sizes must be positive")
         p = _default_grid(nodes) if P is None else P
         if p <= 0 or nodes % p:
             raise ValueError(f"P={p} does not divide the {nodes} processes")
         q = nodes // p
+        if kp <= 0 or kq <= 0 or not (0 <= ip < p) or not (0 <= jq < q):
+            raise ValueError("kp, kq must be positive and (ip, jq) inside the process grid")
         self.dtype = np.dtype(dtype)
         self._typenum = self.dtype.num
+        self._itemsize = self.dtype.itemsize
         mtype = matrix_type(self.dtype)
-        self._name = name.encode()
+        self._name = str(name).encode()
 
         self._bc = <c.parsec_matrix_block_cyclic_t *>calloc(1, sizeof(c.parsec_matrix_block_cyclic_t))
         if self._bc == NULL:
@@ -258,6 +304,7 @@ cdef class BlockCyclic(TiledMatrix):
                                           p, q, kp, kq, ip, jq)
         self._desc = &self._bc.super
         c.parsec_data_collection_set_key(&self._desc.super, self._name)
+        self._context = context
 
         nbytes = <size_t>self._desc.nb_local_tiles * self._desc.bsiz * c.pyparsec_sizeof_matrix_type(mtype)
         if nbytes > 0:
@@ -266,9 +313,14 @@ cdef class BlockCyclic(TiledMatrix):
                 self.release()
                 raise MemoryError(f"cannot allocate {nbytes} bytes for {name}")
             memset(self._bc.mat, 0, nbytes)
-
-        self._context = context
         context.register_collection(self)
+
+    def __dealloc__(self):
+        # TiledMatrix.__dealloc__ runs next and calls destroy() while _bc is
+        # still set; a matrix whose construction failed only has _bc.
+        if self._desc == NULL and self._bc != NULL:
+            free(self._bc)
+            self._bc = NULL
 
     cdef destroy(self):
         if self._bc.mat != NULL:
@@ -279,6 +331,13 @@ cdef class BlockCyclic(TiledMatrix):
         self._bc = NULL
 
 
+cdef _check_redistribute(TiledMatrix source, TiledMatrix target):
+    # redistribute is compiled for double precision only (DTYPE in
+    # parsec/data_dist/matrix/redistribute/redistribute_internal.h).
+    if source.dtype != np.float64 or target.dtype != np.float64:
+        raise TypeError(f"redistribute supports float64 matrices only, not {source.dtype} -> {target.dtype}")
+
+
 def redistribute_new(TiledMatrix source not None, TiledMatrix target not None,
                      size_row=None, size_col=None,
                      int disi_source=0, int disj_source=0,
@@ -287,22 +346,20 @@ def redistribute_new(TiledMatrix source not None, TiledMatrix target not None,
 
     The submatrix starts at (disi_source, disj_source) in source and lands at
     (disi_target, disj_target) in target; the two matrices may use any
-    distribution. Add the returned taskpool to a context and wait for it like
-    any other taskpool. The size defaults to the whole source matrix.
+    distribution. Both must be float64. Add the returned taskpool to the
+    context and wait for it like any other taskpool. The size defaults to
+    the rest of the source matrix.
     """
     cdef c.parsec_taskpool_t *tp
-    cdef Taskpool wrapper
     cdef int rows = source.m - disi_source if size_row is None else size_row
     cdef int cols = source.n - disj_source if size_col is None else size_col
 
-    if source.dtype != target.dtype:
-        raise TypeError(f"source and target dtypes differ ({source.dtype} vs {target.dtype})")
+    _check_redistribute(source, target)
     tp = c.parsec_redistribute_New(source.ptr(), target.ptr(), rows, cols,
                                    disi_source, disj_source, disi_target, disj_target)
     if tp == NULL:
         raise ValueError("parsec_redistribute_New rejected the arguments")
-    wrapper = Taskpool.from_address(<uintptr_t>tp, keepalive=(source, target))
-    return wrapper
+    return Taskpool.from_address(<uintptr_t>tp, keepalive=(source, target))
 
 
 def redistribute_dtd(Context context not None, TiledMatrix source not None, TiledMatrix target not None,
@@ -311,9 +368,9 @@ def redistribute_dtd(Context context not None, TiledMatrix source not None, Tile
                      int disi_target=0, int disj_target=0):
     """Blocking DTD version of :func:`redistribute_new`.
 
-    It starts the context and returns after ``parsec_context_wait``: every
-    taskpool of the context has then completed and the context is idle.
-    Pending DTD work on source and target must have been flushed and waited.
+    It first completes the work of every taskpool of the context, as
+    :meth:`Context.wait` does, then copies the submatrix; on return the
+    context is idle.
     """
     cdef int rc
     cdef int rows = source.m - disi_source if size_row is None else size_row
@@ -322,10 +379,11 @@ def redistribute_dtd(Context context not None, TiledMatrix source not None, Tile
     cdef c.parsec_tiled_matrix_t *src = source.ptr()
     cdef c.parsec_tiled_matrix_t *dst = target.ptr()
 
-    if source.dtype != target.dtype:
-        raise TypeError(f"source and target dtypes differ ({source.dtype} vs {target.dtype})")
-    # parsec_redistribute_dtd() sets up and tears down the DTD tile tables of
-    # both collections itself.
+    _check_redistribute(source, target)
+    # parsec_redistribute_dtd() waits for the whole context, so the other
+    # taskpools must be ready for that (their collections flushed), and it
+    # sets up and tears down the DTD tile tables of both collections itself.
+    context.wait()
     source.dtd_unregister()
     target.dtd_unregister()
     with nogil:
