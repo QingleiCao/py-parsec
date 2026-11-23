@@ -79,6 +79,10 @@ def test_block_cyclic_arguments(ctx):
         py_parsec.BlockCyclic(ctx, 8, 8, 4, 4, dtype=np.int64)
     with pytest.raises(ValueError):
         py_parsec.BlockCyclic(ctx, 8, 8, 0, 4)
+    # PaRSEC gives an empty matrix one tile row or column, with no storage.
+    for m, n in ((0, 8), (8, 0)):
+        with pytest.raises(ValueError, match="positive"):
+            py_parsec.BlockCyclic(ctx, m, n, 4, 4)
     with pytest.raises(ValueError, match="does not divide"):
         py_parsec.BlockCyclic(ctx, 8, 8, 4, 4, P=ctx.nb_nodes + 1)
     with pytest.raises(ValueError, match="process grid"):

@@ -19,7 +19,7 @@ import numpy as np
 cimport numpy as cnp
 
 from py_parsec cimport cparsec as c
-from py_parsec.runtime cimport Context, Taskpool, make_collection_release
+from py_parsec.runtime cimport Context, Taskpool, make_collection_release, raise_errors
 
 cnp.import_array()
 
@@ -146,9 +146,20 @@ cdef class TiledMatrix:
 
     def release(self):
         """Free the matrix and its storage; tile arrays obtained earlier
-        become invalid. Release a matrix only once no taskpool that uses it
-        has work left. Otherwise the matrix is freed when it is no longer
-        referenced (its tile arrays refer to it)."""
+        become invalid. Without it, the matrix is freed when it is no longer
+        referenced (its tile arrays refer to it).
+
+        Raises RuntimeError while a taskpool that used the matrix has work
+        that no wait has completed: wait for it first.
+        """
+        cdef Context ctx = self._context
+        cdef Taskpool tp
+        if self._desc != NULL and ctx is not None and ctx._ctx != NULL:
+            ctx.check_caller()
+            for tp in list(ctx._taskpools):
+                if tp.uses(self):
+                    raise RuntimeError(f"matrix {self.name} is used by a taskpool whose work no wait "
+                                       "has completed: wait for it (or for the context) first")
         self.detach()
         self.free_storage()
 
@@ -300,7 +311,7 @@ cdef class BlockCyclic(TiledMatrix):
         self._bc = NULL
         context.ptr()
         self._context = context
-        if m < 0 or n < 0 or mb <= 0 or nb <= 0:
+        if m <= 0 or n <= 0 or mb <= 0 or nb <= 0:
             raise ValueError("matrix and tile sizes must be positive")
         p = _default_grid(nodes) if P is None else P
         if p <= 0 or nodes % p:
@@ -331,7 +342,7 @@ cdef class BlockCyclic(TiledMatrix):
             self._free_storage = c.parsec_data_free
             self._storage = c.parsec_data_allocate(nbytes)
             if self._storage == NULL:
-                self.release()
+                self.detach()
                 raise MemoryError(f"cannot allocate {nbytes} bytes for {name}")
             memset(self._storage, 0, nbytes)
             self._bc.mat = self._storage
@@ -377,7 +388,8 @@ def redistribute_dtd(Context context not None, TiledMatrix source not None, Tile
 
     It first completes the work of every taskpool of the context, as
     :meth:`Context.wait` does, then copies the submatrix; on return the
-    context is idle.
+    context is idle. An exception raised by a task body during that wait is
+    raised after the copy, which every rank must take part in.
     """
     cdef int rc
     cdef int rows = source.m - disi_source if size_row is None else size_row
@@ -390,7 +402,9 @@ def redistribute_dtd(Context context not None, TiledMatrix source not None, Tile
     # parsec_redistribute_dtd() waits for the whole context, so the other
     # taskpools must be ready for that (their collections flushed), and it
     # sets up and tears down the DTD tile tables of both collections itself.
-    context.wait()
+    # The copy is collective: the exceptions of the task bodies, which may
+    # have been raised on some ranks only, are raised once it is done.
+    errors = context.wait_collect()
     source.dtd_unregister()
     target.dtd_unregister()
     context._in_runtime += 1
@@ -400,3 +414,4 @@ def redistribute_dtd(Context context not None, TiledMatrix source not None, Tile
     context._in_runtime -= 1
     if rc != c.PARSEC_SUCCESS:
         raise RuntimeError(f"parsec_redistribute_dtd failed ({rc})")
+    raise_errors(errors)

@@ -147,3 +147,37 @@ def test_never_enqueued_taskpool(ctx):
     del dropped
     gc.collect()
     ctx.wait()
+
+
+def test_redistribute_dtd_after_a_body_error(ctx, tp):
+    """The copy is collective: an exception of a body, stored on one rank
+    only, is raised after it rather than before (which left the other ranks
+    waiting in the copy for good)."""
+    src = py_parsec.BlockCyclic(ctx, M, N, 8, 8, name="src")
+    dst = py_parsec.BlockCyclic(ctx, M, N, 12, 6, P=1, name="dst")
+    scatter(src, global_matrix())
+    tc = tp.task_class("boom", dtd.Data(dtd.INOUT | dtd.AFFINITY, src))
+
+    def body(tile):
+        raise ValueError("body error")
+
+    tc.add_chore(py_parsec.DEV_CPU, body)
+    tp.insert_task(tc, (src, 0, 0))
+    if src.rank_of(0, 0) == ctx.rank:
+        with pytest.raises(ValueError, match="body error"):
+            redistribute_dtd(ctx, src, dst)
+    else:
+        redistribute_dtd(ctx, src, dst)
+    assert_matches(dst, global_matrix())
+
+
+def test_release_refused_while_a_ptg_taskpool_uses_the_matrix(ctx):
+    src = py_parsec.BlockCyclic(ctx, M, N, 8, 8, name="src")
+    dst = py_parsec.BlockCyclic(ctx, M, N, 12, 6, P=1, name="dst")
+    tp = redistribute_new(src, dst)
+    ctx.add_taskpool(tp)
+    with pytest.raises(RuntimeError, match="no wait has completed"):
+        dst.release()
+    ctx.wait()
+    dst.release()
+    src.release()

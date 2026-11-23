@@ -61,3 +61,16 @@ Changes from the version reviewed in ICLDisco/parsec#834:
   are arrays over data copies that do not outlive the task.
 - The GEMM example verifies correctly when the matrix size is not a multiple
   of the tile size.
+- Calls into the runtime from a thread other than the one that created the
+  context, or from a task body, raise `RuntimeError` instead of crashing or
+  hanging. A context whose thread has ended is still finalized at exit.
+- An exception of a task body no longer makes `redistribute_dtd` skip the
+  collective copy on that rank (the other ranks waited for good): it is
+  raised after the copy.
+- `add_chore` raises past the 24 task classes a DTD taskpool can hold
+  (`dtd.MAX_TASK_CLASSES`), where PaRSEC aborted the process.
+- `TiledMatrix.release()` raises while a taskpool whose work no wait has
+  completed uses the matrix, instead of aborting or freeing tiles PaRSEC
+  still holds.
+- Empty matrices, `Param` subclasses, parameters and tiles created without
+  their constructor are rejected instead of crashing in PaRSEC.

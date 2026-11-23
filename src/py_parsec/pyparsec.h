@@ -29,6 +29,7 @@
 #include "parsec/remote_dep.h"
 #include "parsec/data_dist/matrix/matrix.h"
 #include "parsec/interfaces/dtd/insert_function.h"
+#include "parsec/interfaces/dtd/insert_function_internal.h"
 #if defined(PARSEC_HAVE_MPI)
 #include <mpi.h>
 #endif
@@ -335,6 +336,51 @@ pyparsec_dtd_tile_arena_new(parsec_context_t *ctx, int mtype, int mb, int nb, in
         return -1;
     }
     return id;
+}
+
+/* ------------------------------------------------------------------------
+ * The thread that may call the runtime.
+ *
+ * PaRSEC finds the execution stream of its caller in a thread-local
+ * variable: parsec_init() sets it to the master stream on the calling thread,
+ * the compute threads have their own, and any other thread has none.
+ * ------------------------------------------------------------------------ */
+static inline parsec_execution_stream_t *
+pyparsec_master_stream(parsec_context_t *context)
+{
+    return context->virtual_processes[0]->execution_streams[0];
+}
+
+/* 1 on the thread that created the context, 0 on a compute thread, -1 on any
+ * other thread. */
+static inline int
+pyparsec_caller_kind(parsec_context_t *context)
+{
+    parsec_execution_stream_t *es = parsec_my_execution_stream();
+    if( es == pyparsec_master_stream(context) ) return 1;
+    return (NULL == es) ? -1 : 0;
+}
+
+/* Give the calling thread the master stream; only for the interpreter exit,
+ * once the thread that created the context has ended. */
+static inline void
+pyparsec_adopt_master_stream(parsec_context_t *context)
+{
+    parsec_set_my_execution_stream(pyparsec_master_stream(context));
+}
+
+/* Task classes a DTD taskpool holds, the one of its flush tasks included
+ * (parsec_fatal() beyond that). Their ids are never reused. */
+static inline int
+pyparsec_dtd_task_classes_max(void)
+{
+    return PARSEC_DTD_NB_TASK_CLASSES;
+}
+
+static inline int
+pyparsec_dtd_task_classes_used(const parsec_taskpool_t *tp)
+{
+    return (int)tp->nb_task_classes;
 }
 
 /* ------------------------------------------------------------------------

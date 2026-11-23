@@ -78,6 +78,9 @@ PULLIN = c.PARSEC_PULLIN
 MAX_PARAMS = c.PYPARSEC_MAX_PARAMS
 #: Largest number of Data parameters (flows) of a task class.
 MAX_FLOWS = c.pyparsec_dtd_max_flows()
+#: Largest number of task classes with a chore in a taskpool (PaRSEC keeps
+#: one more for its flush tasks, and never reuses the slot of a released one).
+MAX_TASK_CLASSES = c.pyparsec_dtd_task_classes_max() - 1
 #: Address of a C chore that does nothing (for tasks that only move data,
 #: tests and benchmarks).
 NOOP_CHORE = <uintptr_t><void *>c.pyparsec_noop_chore
@@ -245,8 +248,12 @@ cdef class Tile:
     cdef readonly int n
     cdef readonly int flags
 
+    def __init__(self, *args, **kwargs):
+        raise TypeError("create tiles with tile_of(matrix, m, n), or pass (matrix, m, n) tuples")
+
     def __repr__(self):
-        return f"tile_of({self.matrix.name}, {self.m}, {self.n}, flags={self.flags:#x})"
+        name = self.matrix.name if self.matrix is not None else None
+        return f"tile_of({name}, {self.m}, {self.n}, flags={self.flags:#x})"
 
 
 def tile_of(TiledMatrix matrix not None, int m, int n, int flags=0):
@@ -279,7 +286,7 @@ cdef TiledMatrix _tile_arg(object arg, int i, TaskClass tc, int *pm, int *pn, in
             if pflags[0] & ~_DATA_FLAGS:
                 raise ValueError(f"argument {i} of {tc.name}: unsupported insertion flags {pflags[0]:#x}")
             return <TiledMatrix>tup[0]
-    elif type(arg) is Tile:
+    elif type(arg) is Tile and (<Tile>arg).matrix is not None:
         t = <Tile>arg
         pm[0] = t.m
         pn[0] = t.n
@@ -461,6 +468,7 @@ cdef class TaskClass:
         cdef Taskpool tp = self.taskpool()
         if tp is None or tp._tp == NULL:
             raise RuntimeError("the taskpool of this task class has been released")
+        tp._context.check_caller()
         if (device_type <= 0 or device_type & ~c.PARSEC_DEV_ALL
                 or device_type & (device_type - 1)):
             raise ValueError(f"a chore runs on exactly one device type, not {device_type:#x}")
@@ -481,6 +489,11 @@ cdef class TaskClass:
             fn = <void *><uintptr_t>address_of(body)
         if fn == NULL:
             raise ValueError("NULL chore")
+        if self._devices == 0 and (c.pyparsec_dtd_task_classes_used(tp._tp)
+                                   >= c.pyparsec_dtd_task_classes_max()):
+            raise RuntimeError(f"a DTD taskpool holds at most {MAX_TASK_CLASSES} task classes with a "
+                               f"chore: create the task classes once and reuse them, or use "
+                               f"another taskpool")
 
         if self._tc == NULL:
             self.create(tp)
@@ -615,8 +628,10 @@ cdef class Taskpool(BaseTaskpool):
                 addresses.append(<uintptr_t>tc._tc)
             tc.detach()
         if self._context is not None and self._context._ctx != NULL:
+            # PaRSEC keeps pointers to the names of the task classes.
+            names = [tc._name for tc in self._classes]
             self._context.defer(make_release(self._tp, self._destruct, addresses,
-                                             (self._collections, self._keepalive)))
+                                             (self._collections, self._keepalive, names)))
         self._tp = NULL
 
     def task_class(self, name, *params):
@@ -631,9 +646,11 @@ cdef class Taskpool(BaseTaskpool):
         self.enqueued_context()
         if len(params) > c.PYPARSEC_MAX_PARAMS:
             raise ValueError(f"a task class has at most {c.PYPARSEC_MAX_PARAMS} parameters")
-        for p_obj in params:
-            if not isinstance(p_obj, Param):
+        for i, p_obj in enumerate(params):
+            if type(p_obj) is not Data and type(p_obj) is not Value:
                 raise TypeError(f"task class parameters are Data or Value, not {type(p_obj).__name__}")
+            if (<Param>p_obj).kind != _DATA and (<Param>p_obj).kind != _VALUE:
+                raise ValueError(f"parameter {i} of task class {name} is not initialized")
         tc = TaskClass.__new__(TaskClass)
         for i, p_obj in enumerate(params):
             p = <Param>p_obj
@@ -657,6 +674,7 @@ cdef class Taskpool(BaseTaskpool):
 
     cdef Context check_insert(self, TaskClass tc, Py_ssize_t nargs, int device):
         cdef Context ctx = self.enqueued_context()
+        ctx.check_caller()
         if tc._owner_uid != self.uid:
             raise ValueError(f"task class {tc.name} belongs to another taskpool")
         if not (device & tc._devices):
@@ -822,12 +840,13 @@ cdef class Taskpool(BaseTaskpool):
         cdef c.parsec_dtd_tile_t *dtile
         cdef int m, n, flags
         cdef TiledMatrix matrix
-        if type(tile) is Tile:
+        if type(tile) is Tile and (<Tile>tile).matrix is not None:
             matrix, m, n = (<Tile>tile).matrix, (<Tile>tile).m, (<Tile>tile).n
         elif type(tile) is tuple and len(tile) == 3 and isinstance(tile[0], TiledMatrix):
             matrix, m, n = tile
         else:
             raise TypeError("data_flush takes (matrix, m, n) or tile_of(...)")
+        ctx.check_caller()
         ctx.submit_batch()
         dtile = self.dtd_tile(matrix, m, n)
         ctx.ensure_started()
@@ -844,6 +863,7 @@ cdef class Taskpool(BaseTaskpool):
         cdef c.parsec_taskpool_t *tp = self.ptr()
         cdef Context ctx = self.enqueued_context()
         cdef c.parsec_data_collection_t *dc
+        ctx.check_caller()
         ctx.submit_batch()
         matrix.dtd_register()
         dc = matrix.dc()
@@ -864,6 +884,9 @@ cdef class Taskpool(BaseTaskpool):
             tc.take_errors(errors)
         return errors
 
+    cdef bint uses(self, object matrix):
+        return BaseTaskpool.uses(self, matrix) or (self._pending and matrix in self._collections)
+
     cdef int flush_collections(self) except -1:
         cdef TiledMatrix matrix
         for matrix, used in list(self._collections.items()):
@@ -876,11 +899,13 @@ cdef class Taskpool(BaseTaskpool):
         # A DTD taskpool can be freed whether or not it was enqueued.
         cdef TaskClass tc
         cdef c.parsec_taskpool_t *tp = self._tp
-        for tc in self._classes:
+        cdef list classes = self._classes   # PaRSEC keeps pointers to their names
+        for tc in classes:
             tc.release(tp)
         self._classes = []
         if self._context._ctx != NULL:
             self._destruct(tp)
+        del classes
         BaseTaskpool.forget(self)
         # The collections are kept alive until no task can refer to them.
         self._collections = {}

@@ -45,6 +45,7 @@ cdef class Context:
     cdef object _collections   # every data collection created on this context (weak)
     cdef list _deferred        # releases requested by finalizers, run by drain()
     cdef unsigned long _owner  # the thread that created the context
+    cdef object _owner_thread  # weak reference to its threading.Thread
     cdef int _in_runtime       # depth of PaRSEC calls that may run tasks, made by the owner
     cdef PendingBatch _batch   # the insert_tasks() batch being filled, if any
     cdef readonly int rank
@@ -54,7 +55,10 @@ cdef class Context:
 
     cdef parsec_context_t *ptr(self) except NULL
     cdef bint is_active(self)
+    cdef int check_caller(self) except -1
     cdef int ensure_started(self) except -1
+    cdef list wait_collect(self)
+    cdef fini_at_exit(self)
     cdef int drain(self, bint force=*) except -1
     cdef int submit_batch(self) except -1
     cdef int dtd_tile_arena(self, int mtype, int mb, int nb, int ld) except -1
@@ -76,6 +80,7 @@ cdef class Taskpool:
     cdef Context enqueued_context(self)
     cdef int mark_pending(self) except -1
     cdef int flush_collections(self) except -1
+    cdef bint uses(self, object matrix)
     cdef list take_errors(self)
     cdef release(self)
     cdef destroy(self)

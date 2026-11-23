@@ -74,3 +74,28 @@ def test_finalized_at_exit_with_pending_work():
         print("exiting")
     """)
     assert "exiting" in out
+
+
+def test_context_of_an_ended_thread_finalized_at_exit():
+    """The context was created, and left active, by a thread that has ended:
+    the exit handler runs on the main thread and takes over."""
+    out = run("""
+        import threading, py_parsec
+        from py_parsec import dtd
+        box = []
+        def make():
+            ctx = py_parsec.Context(nb_cores=2)
+            A = py_parsec.BlockCyclic(ctx, 8, 8, 4, 4)
+            tp = dtd.Taskpool()
+            ctx.add_taskpool(tp)
+            tc = tp.task_class("inc", dtd.Data(dtd.INOUT | dtd.AFFINITY, A))
+            tc.add_chore(py_parsec.DEV_CPU, lambda a: a.__iadd__(1))
+            tp.insert_task(tc, (A, 0, 0))
+            tp.wait()
+            box.append(A)
+        thread = threading.Thread(target=make)
+        thread.start()
+        thread.join()
+        print("value", box[0].tile(0, 0)[0, 0])
+    """)
+    assert "value 1.0" in out

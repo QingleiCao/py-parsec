@@ -5,6 +5,7 @@
 import ctypes
 import gc
 import sys
+import threading
 import weakref
 
 import numpy as np
@@ -577,3 +578,122 @@ def test_stored_exception_has_no_locals(ctx, tp):
         assert "tile" not in tb.tb_frame.f_locals
     else:
         tp.wait()
+
+
+def test_calls_from_another_thread_raise(ctx, tp):
+    """Only the thread that created the context may drive the runtime: PaRSEC
+    has no execution stream for any other thread."""
+    A = py_parsec.BlockCyclic(ctx, 8, 8, 4, 4, name="A")
+    tc = tp.task_class("inc", dtd.Data(dtd.INOUT | dtd.AFFINITY, A))
+    tc.add_chore(py_parsec.DEV_CPU, dtd.NOOP_CHORE)
+    other = tp.task_class("other", dtd.Data(dtd.INOUT | dtd.AFFINITY, A))
+    calls = {
+        "insert_task": lambda: tp.insert_task(tc, (A, 0, 0)),
+        "insert_tasks": lambda: tp.insert_tasks(tc, [((A, 0, 0),)]),
+        "data_flush_all": lambda: tp.data_flush_all(A),
+        "add_chore": lambda: other.add_chore(py_parsec.DEV_CPU, dtd.NOOP_CHORE),
+        "Taskpool.wait": tp.wait,
+        "Context.wait": ctx.wait,
+        "Context.start": ctx.start,
+        "release": A.release,
+    }
+    errors = {}
+
+    def run():
+        for name, call in calls.items():
+            try:
+                call()
+            except RuntimeError as e:
+                errors[name] = str(e)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join()
+    assert sorted(errors) == sorted(calls)
+    assert all("thread that created the context" in e for e in errors.values()), errors
+    tp.insert_task(tc, (A, 0, 0))   # still fine from this thread
+    tp.wait()
+
+
+@pytest.mark.parametrize("call", ["insert", "flush", "Taskpool.wait", "Context.wait", "free"])
+def test_body_calling_the_runtime_raises(ctx, tp, call):
+    """A body that calls into the runtime gets a RuntimeError (it used to
+    crash or hang), reported by the wait like any exception of a body."""
+    A = py_parsec.BlockCyclic(ctx, 8, 8, 4, 4, name="A")
+    victim = dtd.Taskpool()
+    ctx.add_taskpool(victim)
+    tc = tp.task_class("reenter", dtd.Data(dtd.INOUT | dtd.AFFINITY, A))
+
+    def body(tile):
+        if call == "insert":
+            tp.insert_task(tc, (A, 0, 0))
+        elif call == "flush":
+            tp.data_flush_all(A)
+        elif call == "Taskpool.wait":
+            tp.wait()
+        elif call == "Context.wait":
+            ctx.wait()
+        else:
+            victim.free()
+
+    tc.add_chore(py_parsec.DEV_CPU, body)
+    tp.insert_task(tc, (A, 0, 0))
+    if A.rank_of(0, 0) == ctx.rank:
+        with pytest.raises(RuntimeError, match="task body cannot"):
+            tp.wait()
+    else:
+        tp.wait()
+    victim.free()
+
+
+def test_task_class_limit(ctx, tp):
+    """PaRSEC aborts the process past its task class limit: the bindings
+    raise before that, and the taskpool stays usable."""
+    A = py_parsec.BlockCyclic(ctx, 8, 8, 4, 4, name="A")
+    classes = []
+    for i in range(dtd.MAX_TASK_CLASSES):
+        tc = tp.task_class(f"class{i}", dtd.Data(dtd.INOUT | dtd.AFFINITY, A))
+        tc.add_chore(py_parsec.DEV_CPU, dtd.NOOP_CHORE)
+        classes.append(tc)
+    extra = tp.task_class("extra", dtd.Data(dtd.INOUT | dtd.AFFINITY, A))
+    with pytest.raises(RuntimeError, match=f"at most {dtd.MAX_TASK_CLASSES} task classes"):
+        extra.add_chore(py_parsec.DEV_CPU, dtd.NOOP_CHORE)
+    for tc in classes:
+        tp.insert_task(tc, (A, 0, 0))
+    tp.wait()
+
+
+def test_parameters_and_tiles_must_be_complete(ctx, tp):
+    """Objects that skipped their constructor used to reach PaRSEC with
+    garbage in them."""
+    class Mine(dtd.Param):
+        pass
+
+    with pytest.raises(TypeError):
+        tp.task_class("mine", Mine())
+    with pytest.raises(ValueError, match="not initialized"):
+        tp.task_class("bare", dtd.Data.__new__(dtd.Data))
+    with pytest.raises(TypeError):
+        dtd.Tile()
+    A = py_parsec.BlockCyclic(ctx, 8, 8, 4, 4, name="A")
+    tc = tp.task_class("ok", dtd.Data(dtd.INOUT | dtd.AFFINITY, A))
+    tc.add_chore(py_parsec.DEV_CPU, dtd.NOOP_CHORE)
+    bare = dtd.Tile.__new__(dtd.Tile)
+    with pytest.raises(TypeError):
+        tp.insert_task(tc, bare)
+    with pytest.raises(TypeError):
+        tp.data_flush(bare)
+
+
+def test_release_refused_while_tasks_may_use_the_matrix(ctx, tp):
+    """Its tasks may have run, but until a wait flushes the matrix, PaRSEC
+    still holds its tiles."""
+    A = py_parsec.BlockCyclic(ctx, 8, 8, 4, 4, name="A")
+    tc = tp.task_class("touch", dtd.Data(dtd.INOUT | dtd.AFFINITY, A))
+    tc.add_chore(py_parsec.DEV_CPU, dtd.NOOP_CHORE)
+    tp.insert_task(tc, (A, 0, 0))
+    with pytest.raises(RuntimeError, match="no wait has completed"):
+        A.release()
+    tp.wait()
+    A.release()
+    assert A.released

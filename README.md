@@ -125,9 +125,12 @@ releases it right away. No PaRSEC function is ever called from a Python
 finalizer: taskpools and matrices collected by Python are released by the
 next call into the runtime from the thread that created the context.
 
-Drive the runtime (insertions, flushes, waits, frees) from one thread,
-normally the one that created the context. Task bodies run on PaRSEC threads
-and must not call these functions.
+Only the thread that created the context can drive the runtime (insert,
+flush, wait, free, release a matrix): PaRSEC identifies its callers by an
+execution stream that only that thread has. Calls from other threads, and
+from task bodies, raise `RuntimeError`. If that thread has ended when the
+interpreter exits, the exit handler takes over its role to finalize the
+context.
 
 ### Matrices
 
@@ -138,7 +141,8 @@ allocated and zeroed; `A.tile(m, n)` and `A.local_tiles()` give them as
 `(mb, nb)` Fortran-ordered NumPy arrays that share the PaRSEC storage. The
 same matrix can be used by DTD and PTG taskpools. A matrix and its storage
 live as long as the matrix object or one of its tile arrays; `A.release()`
-frees them earlier. Once the context is finalized, the tile arrays still
+frees them earlier, once no taskpool that used the matrix has work that no
+wait has completed (it raises `RuntimeError` otherwise). Once the context is finalized, the tile arrays still
 hold their data (to read results after a `with` block), but the matrix can
 no longer be used by tasks.
 
@@ -242,6 +246,9 @@ tiles, 29.5 for 128 x 128):
   taskpool completed and when no task was ready.
 - `redistribute_new` / `redistribute_dtd` handle float64 matrices only, as
   PaRSEC compiles them for double precision.
+- A DTD taskpool holds at most `dtd.MAX_TASK_CLASSES` (24) task classes
+  with a chore, released ones included: create task classes once and reuse
+  them for every insertion.
 
 ## Tests, examples and benchmarks
 
@@ -257,7 +264,7 @@ Each rank runs every test and checks the tiles it owns;
 ```bash
 mpiexec -n 4 python examples/dtd_gemm.py -M 2048 -b 256 --check
 mpiexec -n 4 python examples/redistribute.py
-python benchmarks/overhead.py --cores 8
+python benchmarks/overhead.py --cores 1 8
 ```
 
 ## Development

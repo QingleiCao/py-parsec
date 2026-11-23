@@ -22,13 +22,16 @@ taskpool or a matrix, ``fini``), outside of any call that may run tasks.
 
 Threads
 -------
-Drive the runtime (insertions, flushes, waits, frees) from one thread at a
-time, normally the one that created the context. Task bodies run on PaRSEC
-threads and must not call these functions.
+Only the thread that created the context may drive the runtime (insert,
+flush, wait, free, release): PaRSEC knows its callers by a thread-local
+execution stream that only that thread has. Calls from other threads, and
+from task bodies, raise :class:`RuntimeError`.
 """
 
 import atexit
 import os
+import threading
+import warnings
 import weakref
 
 cimport cython
@@ -61,7 +64,11 @@ def version():
 
 
 def build_info():
-    """Describe the PaRSEC library in use (``parsec_version_ex``), as a dict."""
+    """Describe the PaRSEC library in use (``parsec_version_ex``), as a dict.
+
+    ``comms`` describes the communication engine of the running context: it
+    reads "single process only" until a :class:`Context` exists.
+    """
     cdef char buf[8192]
     buf[0] = 0
     c.parsec_version_ex(sizeof(buf), buf)
@@ -122,7 +129,7 @@ def runtime_initialized():
 def _fini_at_exit():
     # Runs before the Py_AtExit handlers, one of which finalizes MPI for mpi4py.
     if _live is not None:
-        _live.fini()
+        _live.fini_at_exit()
 
 
 cdef raise_errors(list errors):
@@ -177,6 +184,7 @@ cdef class Context:
         self._collections = weakref.WeakSet()
         self._deferred = []
         self._owner = PyThread_get_thread_ident()
+        self._owner_thread = weakref.ref(threading.current_thread())
         self._in_runtime = 0
         self._batch = None
         if _live is not None:
@@ -236,6 +244,16 @@ cdef class Context:
     cdef bint is_active(self):
         return self._ctx != NULL and c.pyparsec_context_is_active(self._ctx)
 
+    cdef int check_caller(self) except -1:
+        """Raise unless the caller may enter the runtime: the thread that
+        created the context, outside of the task bodies it runs."""
+        cdef int kind = c.pyparsec_caller_kind(self.ptr())
+        if kind == 1 and not self._in_runtime:
+            return 0
+        if kind < 0:
+            raise RuntimeError("PaRSEC can only be driven from the thread that created the context")
+        raise RuntimeError("a task body cannot insert, flush, wait for, free or release tasks and data")
+
     cdef int ensure_started(self) except -1:
         cdef c.parsec_context_t *ctx = self.ptr()
         if not c.pyparsec_context_is_active(ctx):
@@ -247,7 +265,8 @@ cdef class Context:
         created the context and outside of any PaRSEC call that may run tasks
         (a context wait, for instance, has already visited every taskpool)."""
         cdef Deferred release
-        if not force and (self._in_runtime or PyThread_get_thread_ident() != self._owner):
+        if not force and (self._ctx == NULL or self._in_runtime
+                          or c.pyparsec_caller_kind(self._ctx) != 1):
             return 0
         while self._deferred and self._ctx != NULL:
             release = self._deferred.pop(0)
@@ -294,6 +313,7 @@ cdef class Context:
         something else.
         """
         cdef c.parsec_context_t *ctx = self.ptr()
+        self.check_caller()
         self.drain()
         return c.parsec_context_start(ctx) == 0
 
@@ -305,14 +325,20 @@ cdef class Context:
         until more work is scheduled. The first exception raised by a Python
         task body since the last wait is raised here.
         """
+        raise_errors(self.wait_collect())
+
+    cdef list wait_collect(self):
+        """wait() without raising the exceptions of the task bodies: returns
+        them, so that a collective step can run on every rank first."""
         cdef c.parsec_context_t *ctx = self.ptr()
         cdef Taskpool tp
         cdef int rc
+        self.check_caller()
         self.submit_batch()
         self.drain()
         if not c.pyparsec_context_is_active(ctx):
             if not self._pending:
-                return
+                return []
             c.parsec_context_start(ctx)
         pending = list(self._pending)
         for tp in pending:
@@ -330,12 +356,13 @@ cdef class Context:
             tp._pending = False
             errors.extend(tp.take_errors())
         self._pending.difference_update(pending)
-        raise_errors(errors)
+        return errors
 
     def add_taskpool(self, Taskpool tp not None):
         """Enqueue a taskpool, of any DSL, in this context."""
         cdef int rc
         cdef c.parsec_context_t *ctx = self.ptr()
+        self.check_caller()
         self.drain()
         if tp._context is not self:
             raise ValueError("the taskpool was created for another context")
@@ -354,6 +381,7 @@ cdef class Context:
         cdef Taskpool tp
         if self._ctx == NULL:
             return
+        self.check_caller()
         errors = []
         try:
             self.wait()     # also inserts the tasks of an open insert_tasks() batch
@@ -376,6 +404,7 @@ cdef class Context:
         # arrays taken from them stay valid; their PaRSEC side goes now.
         for dc in list(self._collections):
             dc._detach()
+        self.drain(True)    # what the garbage collector released meanwhile
         for arena_id in self._dtd_arenas.values():
             c.parsec_dtd_free_arena_datatype(self._ctx, arena_id)
         self._dtd_arenas.clear()
@@ -388,6 +417,21 @@ cdef class Context:
         _live = None
         if errors:
             raise errors[0]
+
+    cdef fini_at_exit(self):
+        """fini() at interpreter exit, which may run on another thread than
+        the one that created the context."""
+        if self._ctx == NULL:
+            return
+        if c.pyparsec_caller_kind(self._ctx) != 1:
+            owner = self._owner_thread()
+            if owner is not None and owner.is_alive():
+                warnings.warn("the thread that created the PaRSEC context is still running at exit: "
+                              "the context is not finalized", RuntimeWarning)
+                return
+            # That thread has ended: this one takes over its execution stream.
+            c.pyparsec_adopt_master_stream(self._ctx)
+        self.fini()
 
     cdef int dtd_tile_arena(self, int mtype, int mb, int nb, int ld) except -1:
         """DTD arena id of a full mb x nb tile, created on first use."""
@@ -569,6 +613,7 @@ cdef class Taskpool:
         cdef c.parsec_taskpool_t *tp
         cdef Context ctx = self.enqueued_context()
         cdef int rc
+        ctx.check_caller()
         ctx.submit_batch()
         tp = self.ptr()
         ctx.drain()
@@ -591,12 +636,23 @@ cdef class Taskpool:
         """Release the taskpool, completing its work first if needed.
         Calling it again does nothing."""
         if self._tp != NULL and self._context._ctx != NULL:
+            self._context.check_caller()
             self._context.submit_batch()
         self.release()
 
     cdef int flush_collections(self) except -1:
         """Hand the data back to the collections before a wait (DTD)."""
         return 0
+
+    cdef bint uses(self, object matrix):
+        """True if work of this taskpool that no wait has completed may use
+        ``matrix``."""
+        if not self._pending:
+            return False
+        for obj in self._keepalive:
+            if obj is matrix:
+                return True
+        return False
 
     cdef list take_errors(self):
         return []
