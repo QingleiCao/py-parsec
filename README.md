@@ -190,6 +190,11 @@ Q f d`.
   256 x 256 tiles, 16 cores), 16 BLAS threads per call instead of one cut the
   throughput from 440 to 165 GFlop/s on one rank, and to 40-130 GFlop/s on 4
   ranks of 4 cores.
+- **Keep results column-major.** Tiles are Fortran-ordered, while NumPy
+  returns products in C order, so `c += a @ b` adds two arrays of opposite
+  layouts: a strided pass over the tile that halved the speed of the GEMM
+  kernel with 128 x 128 tiles. `c += (b.T @ a.T).T` computes the same
+  product in column-major order, at full speed.
 - **Enough work per Python body.** A Python body runs with the GIL, which
   NumPy releases in its heavy calls. With one worker, a Python body costs
   about 0.5 us more than a C one; with many workers per process, the bodies

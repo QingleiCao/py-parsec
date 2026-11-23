@@ -79,7 +79,10 @@ def main():
                              dtd.Data(dtd.INOUT | dtd.AFFINITY, C))
 
         def gemm_body(a, b, c):
-            c += a @ b   # NumPy releases the GIL inside the BLAS call
+            # Tiles are column-major and a @ b would be row-major, making the
+            # update a strided pass over c; (b.T @ a.T).T is the same product,
+            # column-major. NumPy releases the GIL inside the BLAS call.
+            c += (b.T @ a.T).T
 
         gemm.add_chore(py_parsec.DEV_CPU, gemm_body)
 
