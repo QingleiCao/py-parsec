@@ -98,6 +98,15 @@ def main():
     parser.add_argument("--cases", nargs="+", default=["c-1tile", "c-3tiles", "c-values", "py-body"])
     parser.add_argument("--batch", action="store_true", help="insert with Taskpool.insert_tasks")
     args = parser.parse_args()
+    if len(args.cores) > 1:
+        # A process has one PaRSEC context: run each core count in its own.
+        import subprocess
+        import sys
+        for cores in args.cores:
+            cmd = [sys.executable, __file__, "--cores", str(cores), "--tasks", str(args.tasks),
+                   "--repeat", str(args.repeat), "--cases", *args.cases]
+            subprocess.run(cmd + (["--batch"] if args.batch else []), check=True)
+        return
     for cores in args.cores:
         with py_parsec.Context(nb_cores=cores) as ctx:
             for case in args.cases:
