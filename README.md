@@ -188,8 +188,7 @@ Q f d`.
   `OPENBLAS_NUM_THREADS=1` (and `OMP_NUM_THREADS`, `MKL_NUM_THREADS`) before
   NumPy is imported, as `examples/dtd_gemm.py` does. In that example (4096,
   256 x 256 tiles, 16 cores), 16 BLAS threads per call instead of one cut the
-  throughput from 440 to 165 GFlop/s on one rank, and to 40-130 GFlop/s on 4
-  ranks of 4 cores.
+  throughput by more than half on one rank, and more on 4 ranks of 4 cores.
 - **Keep results column-major.** Tiles are Fortran-ordered, while NumPy
   returns products in C order, so `c += a @ b` adds two arrays of opposite
   layouts: a strided pass over the tile that halved the speed of the GEMM
@@ -197,9 +196,9 @@ Q f d`.
   product in column-major order, at full speed.
 - **Enough work per Python body.** A Python body runs with the GIL, which
   NumPy releases in its heavy calls. With one worker, a Python body costs
-  about 0.5 us more than a C one; with many workers per process, the bodies
+  about 0.2 us more than a C one; with many workers per process, the bodies
   and the inserting thread queue for the GIL (an empty body costs about
-  10 us per task with 8 workers). Give each body a fraction of a millisecond
+  8 us per task with 8 workers, 6 us with `insert_tasks`). Give each body a fraction of a millisecond
   of work or more, and use `insert_tasks` for many small tasks. A body that
   spends long in pure Python keeps the GIL for up to
   `sys.getswitchinterval()` (5 ms) before another thread gets it.
@@ -218,27 +217,29 @@ Per-task cost from `benchmarks/overhead.py` and its C counterpart
 `benchmarks/c_overhead.c`, which insert independent tasks on 1 x 1 tiles,
 so that the time is the runtime's and the binding's:
 
-| per task, 1 core | PaRSEC from C | py-parsec |
-| --- | --- | --- |
-| insert, 1 tile, C body | 1.6 us | 2.3 us |
-| insert, 3 tiles, C body | 5.4 us | 6.6 us |
-| insert, 1 tile and 2 values, C body | 1.6 us | 2.5 us |
-| Python body instead of a C one | | +0.5 us |
+| per task, 1 core | PaRSEC from C | `insert_task` | `insert_tasks` |
+| --- | --- | --- | --- |
+| insert, 1 tile, C body | 1.57 us | 2.06 us | 1.75 us |
+| insert, 3 tiles, C body | 5.38 us | 6.04 us | 5.68 us |
+| insert, 1 tile and 2 values, C body | 1.60 us | 2.26 us | 1.93 us |
+| Python body instead of a C one | | +0.22 us | |
 
-About 0.5 us of the difference is the Python loop and call themselves. With
-8 workers, `insert_tasks` inserts at the speed of C (1.7 us per task with a
-C body), and an empty Python body costs 9.7 us per task with `insert_task`
-and 6.8 us with `insert_tasks` (insertion and completion).
+PaRSEC executes the same instructions in both cases. Of the extra
+instructions of an insertion from Python, about a quarter are the binding's
+(1,100 per task with `insert_task`, 400 with `insert_tasks`) and the rest
+are the caller's own loop. With 8 workers, an empty Python body costs 8.1 us
+per task with `insert_task` and 6.0 us with `insert_tasks` (insertion and
+completion).
 
 Tiled GEMM, C += A B with 4096 x 4096 doubles (`examples/dtd_gemm.py`, NumPy
-bodies, one BLAS thread, best of 4 runs), and its fraction of 16 times the
-single-core speed of the same NumPy tile product (42 GFlop/s for 256 x 256
-tiles, 29.5 for 128 x 128):
+bodies, one BLAS thread, best of 3 runs), and its fraction of 16 times the
+single-core speed of the same NumPy tile update (63.7 GFlop/s for 256 x 256
+tiles, 56.6 for 128 x 128):
 
 | tile | 1 rank x 16 cores | 4 ranks x 4 cores |
 | --- | --- | --- |
-| 256 (0.8 ms per task) | 439 GFlop/s, 65% | 350 GFlop/s, 52% |
-| 128 (0.14 ms per task) | 142 GFlop/s, 30% | 240 GFlop/s, 51% |
+| 256 (0.53 ms per task) | 653 GFlop/s, 64% | 558 GFlop/s, 55% |
+| 128 (0.07 ms per task) | 154 GFlop/s, 17% | 399 GFlop/s, 44% |
 
 ## Limitations
 

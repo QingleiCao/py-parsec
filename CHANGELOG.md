@@ -47,10 +47,11 @@ Changes from the version reviewed in ICLDisco/parsec#834:
   arguments are built with one array allocation per tile; PaRSEC worker
   threads keep their Python thread state; `insert_tasks` converts tasks in
   batches and inserts them without the GIL. In the same conditions, the
-  binding adds 0.7 to 1.2 us per insertion over C instead of 1.0 to 1.9 us,
-  an empty Python body on 8 workers costs 9.7 us per task instead of 26.1 us
-  (6.8 us with `insert_tasks`), and the GEMM example with 128 x 128 tiles
-  runs at 142 GFlop/s instead of 56 on 16 cores.
+  binding adds 0.5 to 0.7 us per insertion over C instead of 1.0 to 1.6 us
+  (0.2 to 0.3 us with `insert_tasks`), an empty Python body on 8 workers
+  costs 8.1 us per task instead of 25.5 us (6.0 us with `insert_tasks`), and
+  the GEMM example with 128 x 128 tiles and the same body runs at 143
+  GFlop/s instead of 56 on 16 cores.
 - All exceptions raised by bodies are reported (the first is raised with a
   note counting the others).
 - A second `Context` raises an error instead of crashing in `parsec_init`.
@@ -60,7 +61,8 @@ Changes from the version reviewed in ICLDisco/parsec#834:
 - Saved exceptions of task bodies no longer keep the body's locals, which
   are arrays over data copies that do not outlive the task.
 - The GEMM example verifies correctly when the matrix size is not a multiple
-  of the tile size.
+  of the tile size, and keeps its update column-major (`c += (b.T @ a.T).T`),
+  which doubles the speed of its body with 128 x 128 tiles.
 - Calls into the runtime from a thread other than the one that created the
   context, or from a task body, raise `RuntimeError` instead of crashing or
   hanging. A context whose thread has ended is still finalized at exit.
