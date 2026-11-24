@@ -1,0 +1,7 @@
+include README.md CHANGELOG.md LICENSE
+recursive-include src/py_parsec *.pyx *.pxd *.h
+recursive-include tests *.py
+recursive-include examples *.py
+recursive-include benchmarks *.py *.c
+exclude src/py_parsec/*.c
+global-exclude *.so *.pyc __pycache__

@@ -1,0 +1,16 @@
+# Build products
+build/
+dist/
+*.egg-info/
+src/py_parsec/*.c
+src/py_parsec/*.html
+*.so
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Core files left by crashed runs
+core
+core.[0-9]*

@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+  schedule:
+    - cron: "0 6 * * 1"   # weekly, to follow PaRSEC master
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OMPI_MCA_rmaps_base_oversubscribe: "yes"
+  OMPI_MCA_btl_vader_single_copy_mechanism: none
+  OPENBLAS_NUM_THREADS: "1"
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }}, PaRSEC ${{ matrix.build-type }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.10"
+            build-type: Debug
+          - python: "3.13"
+            build-type: Release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config bison flex libhwloc-dev libopenmpi-dev openmpi-bin
+
+      - name: Find the PaRSEC master revision
+        id: parsec
+        run: echo "sha=$(git ls-remote https://github.com/ICLDisco/parsec.git refs/heads/master | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache PaRSEC
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ~/parsec
+          key: parsec-${{ runner.os }}-${{ matrix.build-type }}-${{ steps.parsec.outputs.sha }}
+
+      - name: Build PaRSEC
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git init -q parsec-src
+          git -C parsec-src fetch -q --depth 1 https://github.com/ICLDisco/parsec.git ${{ steps.parsec.outputs.sha }}
+          git -C parsec-src checkout -q FETCH_HEAD
+          paranoid=OFF
+          if [ "${{ matrix.build-type }}" = Debug ]; then paranoid=ON; fi
+          cmake -S parsec-src -B parsec-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build-type }} -DPARSEC_DEBUG_PARANOID=$paranoid \
+            -DBUILD_SHARED_LIBS=ON -DBUILD_TESTING=OFF -DPARSEC_DIST_WITH_MPI=ON \
+            -DPARSEC_GPU_WITH_CUDA=OFF -DPARSEC_GPU_WITH_HIP=OFF -DPARSEC_GPU_WITH_LEVEL_ZERO=OFF \
+            -DCMAKE_INSTALL_PREFIX="$HOME/parsec"
+          cmake --build parsec-build --parallel
+          cmake --install parsec-build
+
+      - name: Install py-parsec
+        run: |
+          python -m pip install --upgrade pip
+          PARSEC_ROOT="$HOME/parsec" python -m pip install -v ".[test]"
+          python -c "import py_parsec; print(py_parsec.__version__, py_parsec.version())"
+
+      - name: Test on 1 process
+        run: python -m pytest -v tests
+
+      - name: Test on 2 and 4 processes
+        env:
+          PY_PARSEC_TEST_CORES: "1"
+        run: |
+          mpiexec -n 2 python -m pytest -q tests
+          mpiexec -n 4 python -m pytest -q tests
+
+      - name: Run the examples and the benchmark
+        run: |
+          mpiexec -n 4 python examples/dtd_gemm.py -M 200 -N 150 -K 130 -b 32 -c 1 --runs 2 --check
+          mpiexec -n 4 python examples/dtd_gemm.py -M 100 -K 70 -b 32 -c 1 --runs 2 --batch --check
+          mpiexec -n 4 python examples/redistribute.py
+          python benchmarks/overhead.py --cores 2 --tasks 20000 --repeat 1
+
+  sdist:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build and check the sdist
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build --sdist
+          python -m twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
