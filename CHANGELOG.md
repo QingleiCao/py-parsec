@@ -4,7 +4,7 @@ All notable changes to py-parsec are listed here. The project follows
 [semantic versioning](https://semver.org); until 1.0, minor versions may
 change the API.
 
-## 0.1.0 (2026-11-24)
+## 0.1.0 (2026-11-26)
 
 First release, moved out of the PaRSEC repository (ICLDisco/parsec#834,
 which replaced ICLDisco/parsec#765) into a standalone package built against
