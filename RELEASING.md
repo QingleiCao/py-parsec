@@ -1,12 +1,13 @@
 # Releasing py-parsec
 
-py-parsec is published on PyPI as a source distribution only: the extension
-modules have to be compiled against the user's PaRSEC, so there are no
-wheels.
+py-parsec is published on PyPI as `python-parsec` (PyPI refuses `py-parsec`
+as too similar to the unrelated `pyparsec`), as a source distribution only:
+the extension modules have to be compiled against the user's PaRSEC, so
+there are no wheels.
 
 ## One-time setup
 
-1. On PyPI, add a trusted publisher for the `py-parsec` project (pending
+1. On PyPI, add a trusted publisher for the `python-parsec` project (pending
    publisher for a first release): owner `QingleiCao`, repository
    `py-parsec`, workflow `release.yml`, environment `pypi`.
 2. In the GitHub repository settings, create an environment named `pypi`

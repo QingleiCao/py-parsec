@@ -69,8 +69,12 @@ Point `PARSEC_ROOT` at the PaRSEC installation prefix (the directory that
 holds `lib/pkgconfig/parsec.pc` or `lib64/pkgconfig/parsec.pc`):
 
 ```bash
-PARSEC_ROOT=/path/to/parsec/install pip install py-parsec
+PARSEC_ROOT=/path/to/parsec/install pip install python-parsec
 ```
+
+The PyPI package is named `python-parsec`, because PyPI treats `py-parsec` as
+the same name as the unrelated `pyparsec` project; it installs the
+`py_parsec` module.
 
 or, from a clone of this repository:
 

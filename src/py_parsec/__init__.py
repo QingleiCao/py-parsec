@@ -12,7 +12,7 @@
 
 try:
     from importlib.metadata import PackageNotFoundError, version as _dist_version
-    __version__ = _dist_version("py-parsec")
+    __version__ = _dist_version("python-parsec")
 except PackageNotFoundError:  # pragma: no cover - running from a source tree
     __version__ = "0+unknown"
 

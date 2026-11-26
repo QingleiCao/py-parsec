@@ -8,7 +8,8 @@ change the API.
 
 First release, moved out of the PaRSEC repository (ICLDisco/parsec#834,
 which replaced ICLDisco/parsec#765) into a standalone package built against
-an installed PaRSEC.
+an installed PaRSEC. Published on PyPI as `python-parsec`; the module is
+`py_parsec`.
 
 - `Context` (`parsec_init` / `parsec_fini`), one per process; compute
   threads start when work is scheduled, `wait()` completes every taskpool.
